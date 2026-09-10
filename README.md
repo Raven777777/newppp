@@ -59,6 +59,20 @@ Cloudflare 标准代理会**缓冲完整请求体后才回源**（免费 100MB �
 | 协议指纹 | quinn 指纹≠Chrome（主动探测可辨） | ✅ 无 QUIC 可探测 |
 | 流量形态 | 长连接多流（像视频/云盘） | 无限长双向 POST/WS（内容级分析仍可标记）|
 
+### 域名路由速查：走不走 CF 看云朵，不看 scheme
+
+CF 路由由域名的 **DNS 代理状态**决定（橙云=代理、灰云=仅 DNS 直连）；`https://` / `wss://` 只是承载方式（双工 POST / WebSocket），与是否经过 CF 无关：
+
+| 配置 | 实际走向 | 可用性 |
+|---|---|---|
+| `--url https://灰云域/api/ppp` | 直连 VPS | ✅ 速度最优的 POST 兜底 |
+| `--url wss://灰云域/api/ppp` | 仍直连（wss 不会"激活"CF） | ✅ 与上行等价 |
+| `--url https://橙云域/api/ppp` | 走 CF | ❌ CF 缓冲完整 POST 请求体才回源，双工 POST 永远到不了源站 |
+| `--url wss://橙云域/api/ppp` | 走 CF | ✅ 橙云下唯一可用承载（WS 不被缓冲，免费版完整支持） |
+| `--server` 指向橙云域 | WT 会话在 CF 边缘被终止 | ❌ CF 不透传 QUIC/WebTransport，主路径必须灰云域 |
+
+**推荐组合**：`--server https://灰云域`（WT 主路径保带宽）+ `--url https://灰云域/api/ppp`（直连 POST 兜底，远快于经 CF）；仅当需要隐藏源站 IP 时，才把兜底换成 `--url wss://橙云域/api/ppp`（代价是 CF 免费版链路可能很慢，实测有低至 ~50KB/s 的情形）。
+
 ## 架构
 
 | 路径 | 说明 |
@@ -360,7 +374,7 @@ CF 的代理模型是"**边缘终止一切，仅 TCP 回源**"——QUIC/UDP 在
 4. 注意 WS 单条消息上限与空闲超时由 CF 管理：本实现帧 ≤~17KB、30s 心跳，均在安全范围内；
 5. 服务端日志中 WS 通道与 POST 通道均表现为 mode-A 连接（认证/限速/回收逻辑一致）。
 
-**推荐组合拳（免费、兼顾隐藏与性能）**：主域名橙云走 wss 保底，另开一个**灰云子域**（如 `wt.love4z.cn`，仅 DNS，A 记录指向源站）专跑 WT 主路径；客户端两个都配——WT 走灰云子域，传输层故障自动回落到橙云 wss 通道：
+**推荐组合拳（免费、兼顾隐藏与性能）**：主域名橙云走 wss 保底，另开一个**灰云子域**（如 `wt.love4z.cn`，仅 DNS，A 记录指向源站）专跑 WT 主路径；客户端两个都配——WT 走灰云子域，传输层故障自动回落到橙云 wss 通道（不要求隐藏源站 IP 时，把兜底换成灰云直连 POST 更快，见「域名路由速查」）：
 
 ```bash
 newppp -c --auth alice:secret123 \
@@ -407,7 +421,7 @@ newppp -c --auth alice:secret123 \
 * `--listen` 提供时仅端口生效（wtransport 绑定 API 限制），总是绑定全部接口；需要限定地址时用防火墙/iptables 收敛，或省略 `--listen` 完全不监听 UDP。
 * 服务端对未认证连接数无显式上限（依赖 QUIC/TLS 层自身的限流）。
 * quinn 的 QUIC/TLS 指纹与 Chrome 不同；主动 QUIC 指纹探测可区分（被动分类无特征）。
-* `too many gaps in stream buffer`：quinn 对流重组缓冲乱序空洞数的内部保护，在丢包/乱序严重的弱网 UDP 链路 + 大接收窗口（8MB）下可能触发，触发后该连接中止、会话自动回落 HTTPS POST。受影响时可把 `src/quic_tune.rs` 中流接收窗口调小。
+* `too many gaps in stream buffer`：quinn 对流重组缓冲乱序空洞数的内部保护，丢包/乱序严重的弱网 UDP 链路 + 大接收窗口下会触发，触发后该连接中止、会话自动回落 HTTPS POST。接收窗口默认已调为 2MB（`src/quic_tune.rs`，2MB ≈ 5 倍碎片余量，300ms RTT 单流 ≈ 53Mbps）；若仍受影响可进一步调小。
 * UDP 443 不应答普通 h3 GET（也不发 Alt-Svc）：浏览器不会来（无 Alt-Svc），但定制探测工具可发现"这个 QUIC 服务不是网页"；WT 握手探测则得到 404，与"不支持 WT 的普通源"一致。根治需换 quinn+h3 栈实现 GET/WT 同端口共宿——留作后续演进。
 * 流量形态：长连接多流持续传输（像视频会议/云盘），内容级分析对任何形态都有告警可能。
 * 降级路径（模式 A）依赖 nginx 关闭缓冲；本实现已发送 `X-Accel-Buffering: no`。

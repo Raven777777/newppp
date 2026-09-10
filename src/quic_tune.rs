@@ -16,7 +16,13 @@ pub fn tuned() -> QuicTransportConfig {
     let mut t = QuicTransportConfig::default();
 
     // Per-stream receive window (quinn default ~1.2MB).
-    t.stream_receive_window(VarInt::from(8 * 1024 * 1024u32));
+    //
+    // 2MB, not larger: on lossy paths (cross-border UDP) a big window lets
+    // too many out-of-order fragments accumulate and trips quinn's
+    // "too many gaps in stream buffer" protection, which aborts the whole
+    // connection mid-download. 2MB keeps ~5x headroom below that limit
+    // while still allowing ~50Mbps per stream at 300ms RTT.
+    t.stream_receive_window(VarInt::from(2 * 1024 * 1024u32));
     // Total bytes in flight per stream without peer acknowledgement.
     t.send_window(32 * 1024 * 1024);
 
