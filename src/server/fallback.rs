@@ -213,6 +213,7 @@ fn spawn_mode_a_channel<R>(
         tcp_routes: Default::default(),
         udp_routes: Default::default(),
         max_per_conn: crate::server::wt::MAX_PER_CONN,
+        last_active: std::sync::atomic::AtomicI64::new(crate::server::state::now_millis()),
     });
     st.conns.insert(conn_id, conn.clone());
 

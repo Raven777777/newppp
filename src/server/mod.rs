@@ -20,7 +20,7 @@ use tracing::{info, warn};
 use wtransport::Identity;
 
 use crate::config::{CertSource, ServerConfig};
-use crate::proto::crypto::{self, verify_bearer, AuthPayload, AUTH_WINDOW};
+use crate::proto::crypto::{self, AuthPayload, AUTH_WINDOW};
 use crate::proto::frame::Frame;
 use state::ServerState;
 
@@ -54,7 +54,12 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
     match cfg.listen {
         Some(addr) => {
             let listen: SocketAddr = addr.parse().context("bad --listen address")?;
-            tasks.spawn(wt::run_wt(st.clone(), listen, tls.identity));
+            tasks.spawn(wt::run_wt(
+                st.clone(),
+                listen,
+                tls.identity,
+                cfg.recv_window,
+            ));
         }
         None => {
             info!("WebTransport (QUIC/UDP) listener disabled (--listen not set): pure-website mode")
@@ -159,6 +164,11 @@ async fn setup_tls(src: CertSource) -> Result<TlsMaterial> {
 // ---------------------------------------------------------------------------
 
 /// Verify the HTTP-level bearer header. Returns (uid, static_key).
+///
+/// The token's (ts, nonce) pair is recorded in the server-wide nonce cache:
+/// the same bearer is accepted exactly once, so a captured token cannot be
+/// replayed within the ±60s timestamp window. MAC verification runs first,
+/// so unauthenticated traffic cannot pollute the cache.
 pub fn bearer_user<'a>(
     st: &'a ServerState,
     header: Option<&str>,
@@ -169,11 +179,12 @@ pub fn bearer_user<'a>(
         .or_else(|| h.strip_prefix("bearer "))?;
     let uid = crypto::bearer_uid(token)?;
     let key = st.static_keys.get(uid)?;
-    if verify_bearer(token, key, uid, AUTH_WINDOW) {
-        Some((uid.to_string(), key))
-    } else {
-        None
+    let (ts, nonce) = crypto::verify_bearer_parts(token, key, uid, AUTH_WINDOW)?;
+    if !st.check_and_remember_nonce(uid, &nonce, ts) {
+        warn!("replayed bearer token for uid={uid}");
+        return None;
     }
+    Some((uid.to_string(), key))
 }
 
 /// Boolean variant used on the WT session-request path.
@@ -202,4 +213,69 @@ pub fn auth_from_frame(st: &ServerState, f: &Frame) -> Option<(String, [u8; 32],
         return Some((uid.clone(), *skey, ap));
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::state::ServerState;
+    use dashmap::DashMap;
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicU64;
+    use std::time::Duration;
+
+    fn test_state() -> ServerState {
+        let key = crypto::derive_static_key("pw", "alice");
+        let mut static_keys = HashMap::new();
+        static_keys.insert("alice".to_string(), key);
+        ServerState {
+            static_keys,
+            conns: DashMap::new(),
+            conn_seq: AtomicU64::new(1),
+            active_sessions: AtomicU64::new(0),
+            max_sessions: 10,
+            rate_mbps: 0,
+            idle: Duration::from_secs(60),
+            seen_nonces: DashMap::new(),
+            path: "/api/ppp".into(),
+        }
+    }
+
+    /// The same bearer token (same ts+nonce) must be accepted exactly once;
+    /// a replay within the timestamp window is rejected.
+    #[test]
+    fn bearer_replay_rejected_second_use() {
+        let st = test_state();
+        let key = crypto::derive_static_key("pw", "alice");
+        let header = format!("Bearer {}", crypto::make_bearer(&key, "alice"));
+        assert!(bearer_user(&st, Some(header.as_str())).is_some());
+        assert!(bearer_user(&st, Some(header.as_str())).is_none());
+    }
+
+    /// Fresh tokens (fresh nonce each mint) keep working normally.
+    #[test]
+    fn bearer_fresh_nonce_accepted_after_previous_use() {
+        let st = test_state();
+        let key = crypto::derive_static_key("pw", "alice");
+        let h1 = format!("Bearer {}", crypto::make_bearer(&key, "alice"));
+        let h2 = format!("Bearer {}", crypto::make_bearer(&key, "alice"));
+        assert!(bearer_user(&st, Some(h1.as_str())).is_some());
+        assert!(bearer_user(&st, Some(h2.as_str())).is_some());
+    }
+
+    /// The nonce cache must not be polluted by traffic that fails MAC
+    /// verification (only verified tokens may record their nonce).
+    #[test]
+    fn bearer_bad_mac_does_not_pollute_nonce_cache() {
+        let st = test_state();
+        let key = crypto::derive_static_key("pw", "alice");
+        let header = format!("Bearer {}", crypto::make_bearer(&key, "alice"));
+        // tamper with the MAC (last hex chunk)
+        let mut tampered = header.clone();
+        let last = tampered.len() - 1;
+        tampered.replace_range(last.., if &tampered[last..] == "0" { "1" } else { "0" });
+        assert!(bearer_user(&st, Some(tampered.as_str())).is_none());
+        // nonce map untouched by the failed attempt
+        assert_eq!(st.seen_nonces.len(), 0);
+    }
 }

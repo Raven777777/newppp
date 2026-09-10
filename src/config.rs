@@ -49,6 +49,12 @@ pub struct Cli {
     #[arg(long = "skip-verify")]
     pub skip_verify: bool,
 
+    /// [client+server] QUIC per-stream receive window, MB (1..=64).
+    /// Bigger = faster on clean high-latency links; smaller = more resilient
+    /// to packet loss ("too many gaps" protection).
+    #[arg(long = "recv-window", value_name = "MB", default_value_t = 2)]
+    pub recv_window_mb: u64,
+
     // ---------------- server options ----------------
     /// [server] WebTransport (QUIC over UDP) listen address; omit to disable
     /// the WT listener entirely (pure-website mode, nothing to firewall)
@@ -107,6 +113,7 @@ pub struct ClientConfig {
     pub uid: String,
     pub password: String,
     pub skip_verify: bool,
+    pub recv_window: u32,
 }
 
 /// Where the server loads its TLS material from.
@@ -128,6 +135,7 @@ pub struct ServerConfig {
     pub max_sessions: usize,
     pub rate_mbps: u64,
     pub idle_secs: u64,
+    pub recv_window: u32,
 }
 
 fn parse_auth(raw: &str) -> anyhow::Result<(String, String)> {
@@ -175,6 +183,7 @@ impl Cli {
             uid,
             password,
             skip_verify: self.skip_verify,
+            recv_window: recv_window_bytes(self.recv_window_mb)?,
         })
     }
 
@@ -209,6 +218,7 @@ impl Cli {
             max_sessions: self.max_sessions.max(1),
             rate_mbps: self.rate_mbps,
             idle_secs: self.idle_secs.max(5),
+            recv_window: recv_window_bytes(self.recv_window_mb)?,
         })
     }
 }
@@ -222,4 +232,12 @@ fn normalize_path(p: &str) -> String {
     } else {
         format!("/{p}")
     }
+}
+
+fn recv_window_bytes(mb: u64) -> anyhow::Result<u32> {
+    anyhow::ensure!(
+        (1..=64).contains(&mb),
+        "--recv-window must be 1..=64 MB, got {mb}"
+    );
+    Ok(mb as u32 * 1024 * 1024)
 }

@@ -63,6 +63,10 @@ pub struct ConnState {
     /// mux-path UDP relays: sid -> sockets
     pub udp_routes: DashMap<u32, Arc<UdpRelay>>,
     pub max_per_conn: usize,
+    /// Connection-level liveness (any register/touch refreshes it). Note
+    /// that keepalive Pings deliberately do NOT count: idle connections
+    /// with no sessions are reaped by the reaper regardless.
+    pub last_active: AtomicI64,
 }
 
 impl ConnState {
@@ -70,6 +74,8 @@ impl ConnState {
     /// when the connection dies (or is swept), every session is cancelled
     /// and its global quota released.
     pub fn register(&self, sid: u32) -> CancellationToken {
+        self.last_active
+            .store(now_millis(), std::sync::atomic::Ordering::Relaxed);
         let token = self.cancel.child_token();
         self.sessions
             .insert(sid, Arc::new(SessionHandle::from_token(token.clone())));
@@ -77,6 +83,8 @@ impl ConnState {
     }
 
     pub fn register_with(&self, sid: u32, token: CancellationToken) -> Arc<SessionHandle> {
+        self.last_active
+            .store(now_millis(), std::sync::atomic::Ordering::Relaxed);
         let h = Arc::new(SessionHandle::from_token(token));
         self.sessions.insert(sid, h.clone());
         h
@@ -99,9 +107,17 @@ impl ConnState {
     }
 
     pub fn touch(&self, sid: u32) {
+        self.last_active
+            .store(now_millis(), std::sync::atomic::Ordering::Relaxed);
         if let Some(h) = self.sessions.get(&sid) {
             h.touch();
         }
+    }
+
+    /// Connection-level idle duration (any register/touch resets it).
+    pub fn idle_for(&self) -> Duration {
+        let last = self.last_active.load(std::sync::atomic::Ordering::Relaxed);
+        Duration::from_millis(now_millis().saturating_sub(last) as u64)
     }
 
     pub fn session_count(&self) -> usize {
@@ -181,6 +197,13 @@ impl ServerState {
     /// tasks observe `false` from `drop_session` and skip their release).
     pub fn reap_idle(&self) {
         let idle = self.idle;
+        // A connection with no sessions left and no data activity for a
+        // while is dead weight (its state entry, pumps and QUIC transport
+        // all linger): tear it down too. Clients reconnect transparently on
+        // their next request. 3× the session idle keeps clear separation
+        // from per-session reaping.
+        let conn_idle = idle * 3;
+        let mut dead_conns: Vec<u64> = Vec::new();
         for c in self.conns.iter() {
             // Collect first: `drop_session` removes from `sessions`, which
             // must not happen inside an iteration over the same map.
@@ -203,6 +226,15 @@ impl ServerState {
                     self.release_session();
                 }
             }
+            // Remove from the map only after the iteration ends (DashMap).
+            if c.sessions.is_empty() && c.idle_for() > conn_idle {
+                tracing::debug!("reaping idle conn {} (uid={})", c.id, c.uid);
+                c.cancel.cancel();
+                dead_conns.push(c.id);
+            }
+        }
+        for id in dead_conns {
+            self.conns.remove(&id);
         }
     }
 
@@ -243,6 +275,7 @@ mod tests {
             tcp_routes: Default::default(),
             udp_routes: Default::default(),
             max_per_conn: 8,
+            last_active: AtomicI64::new(now_millis()),
         })
     }
 
@@ -293,6 +326,35 @@ mod tests {
         assert!(conn.udp_routes.get(&9).is_none());
         assert!(relay.cancel.is_cancelled());
         assert_eq!(st.active_sessions.load(Ordering::Relaxed), 0);
+    }
+
+    /// A connection with no sessions and no data activity beyond 3×idle is
+    /// cancelled and swept out of the connection table (keepalive pings do
+    /// not count as activity).
+    #[test]
+    fn reap_idle_cancels_long_idle_empty_conn() {
+        let st = test_state();
+        let conn = test_conn(1);
+        st.conns.insert(1, conn.clone());
+        conn.last_active
+            .store(now_millis() - 200_000, Ordering::Relaxed);
+        st.reap_idle();
+        assert!(st.conns.get(&1).is_none());
+        assert!(conn.cancel.is_cancelled());
+    }
+
+    /// A connection with recent activity must never be conn-reaped, even
+    /// right after its sessions were individually reaped.
+    #[test]
+    fn reap_idle_keeps_active_conn() {
+        let st = test_state();
+        let conn = test_conn(1);
+        st.conns.insert(1, conn.clone());
+        conn.register(5);
+        conn.touch(5); // recent activity
+        st.reap_idle();
+        assert!(st.conns.get(&1).is_some());
+        assert!(!conn.cancel.is_cancelled());
     }
 
     #[test]

@@ -65,7 +65,7 @@ pub struct WtConn {
 impl WtPool {
     pub fn new(cfg: &ClientConfig, url: &str) -> Result<WtPool> {
         let static_key = crate::proto::crypto::derive_static_key(&cfg.password, &cfg.uid);
-        let endpoint = Endpoint::client(build_tls_config(cfg.skip_verify)?)?;
+        let endpoint = Endpoint::client(build_tls_config(cfg.skip_verify, cfg.recv_window)?)?;
         Ok(WtPool {
             cfg: Arc::new(PoolCfg {
                 url: url.to_string(),
@@ -177,7 +177,7 @@ impl WtPool {
     }
 }
 
-fn build_tls_config(skip_verify: bool) -> Result<WtClientConfig> {
+fn build_tls_config(skip_verify: bool, recv_window: u32) -> Result<WtClientConfig> {
     use wtransport::tls::client::build_default_tls_config;
     use wtransport::tls::client::NoServerVerification;
 
@@ -198,7 +198,7 @@ fn build_tls_config(skip_verify: bool) -> Result<WtClientConfig> {
 
     Ok(WtClientConfig::builder()
         .with_bind_default()
-        .with_custom_tls_and_transport(tls, crate::quic_tune::tuned())
+        .with_custom_tls_and_transport(tls, crate::quic_tune::tuned(recv_window))
         .keep_alive_interval(Some(Duration::from_secs(15)))
         .build())
 }

@@ -192,23 +192,26 @@ pub fn make_bearer(key: &[u8; KEY_LEN], uid: &str) -> String {
     format!("{uid}.{ts}.{}.{}", hex(&nonce), hex(&mac))
 }
 
-/// Parse and verify a bearer token for `expected_uid`.
-pub fn verify_bearer(token: &str, key: &[u8; KEY_LEN], expected_uid: &str, window: u64) -> bool {
+/// Parse and verify a bearer token for `expected_uid`. On success returns
+/// the embedded `(ts, nonce)` so callers can record it in a replay cache.
+pub fn verify_bearer_parts(
+    token: &str,
+    key: &[u8; KEY_LEN],
+    expected_uid: &str,
+    window: u64,
+) -> Option<(u64, [u8; SALT_LEN])> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 4 || parts[0] != expected_uid {
-        return false;
+        return None;
     }
-    let ts: u64 = match parts[1].parse() {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
+    let ts: u64 = parts[1].parse().ok()?;
     let nonce = match unhex(parts[2]) {
         Some(v) if v.len() == SALT_LEN => {
             let mut n = [0u8; SALT_LEN];
             n.copy_from_slice(&v);
             n
         }
-        _ => return false,
+        _ => return None,
     };
     let mac = match unhex(parts[3]) {
         Some(v) if v.len() == MAC_LEN => {
@@ -216,12 +219,12 @@ pub fn verify_bearer(token: &str, key: &[u8; KEY_LEN], expected_uid: &str, windo
             m.copy_from_slice(&v);
             m
         }
-        _ => return false,
+        _ => return None,
     };
     let now = now_unix();
     // saturating: `ts` is attacker-controlled and must not overflow
     if now.saturating_sub(ts) > window || ts.saturating_sub(now) > window {
-        return false;
+        return None;
     }
     let expect = auth_mac(key, expected_uid, ts, &nonce);
     // constant-time compare
@@ -229,7 +232,11 @@ pub fn verify_bearer(token: &str, key: &[u8; KEY_LEN], expected_uid: &str, windo
     for (a, b) in expect.iter().zip(mac.iter()) {
         diff |= a ^ b;
     }
-    diff == 0
+    if diff == 0 {
+        Some((ts, nonce))
+    } else {
+        None
+    }
 }
 
 pub fn hex(b: &[u8]) -> String {
@@ -369,10 +376,10 @@ mod tests {
     fn bearer_roundtrip() {
         let key = derive_static_key("pw", "alice");
         let tok = make_bearer(&key, "alice");
-        assert!(verify_bearer(&tok, &key, "alice", AUTH_WINDOW));
-        assert!(!verify_bearer(&tok, &key, "bob", AUTH_WINDOW));
+        assert!(verify_bearer_parts(&tok, &key, "alice", AUTH_WINDOW).is_some());
+        assert!(verify_bearer_parts(&tok, &key, "bob", AUTH_WINDOW).is_none());
         let key2 = derive_static_key("pw2", "alice");
-        assert!(!verify_bearer(&tok, &key2, "alice", AUTH_WINDOW));
+        assert!(verify_bearer_parts(&tok, &key2, "alice", AUTH_WINDOW).is_none());
     }
 
     #[test]
@@ -381,7 +388,7 @@ mod tests {
         let nonce = [0u8; SALT_LEN];
         let mac = auth_mac(&key, "alice", u64::MAX, &nonce);
         let tok = format!("alice.{}.{}.{}", u64::MAX, hex(&nonce), hex(&mac));
-        assert!(!verify_bearer(&tok, &key, "alice", AUTH_WINDOW));
+        assert!(verify_bearer_parts(&tok, &key, "alice", AUTH_WINDOW).is_none());
     }
 
     #[test]

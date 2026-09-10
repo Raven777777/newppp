@@ -26,10 +26,11 @@ pub async fn run_wt(
     st: Arc<ServerState>,
     addr: std::net::SocketAddr,
     identity: Identity,
+    recv_window: u32,
 ) -> Result<()> {
     let config = ServerConfig::builder()
         .with_bind_default(addr.port())
-        .with_custom_transport(identity, crate::quic_tune::tuned())
+        .with_custom_transport(identity, crate::quic_tune::tuned(recv_window))
         .build();
     let endpoint = Endpoint::server(config)?;
     info!("WebTransport (QUIC/h3) listening on udp://{addr}");
@@ -118,6 +119,7 @@ async fn handle_wt_conn(st: Arc<ServerState>, conn: Connection) -> Result<()> {
         tcp_routes: Default::default(),
         udp_routes: Default::default(),
         max_per_conn: MAX_PER_CONN,
+        last_active: std::sync::atomic::AtomicI64::new(crate::server::state::now_millis()),
     });
     st.conns.insert(conn_id, conn_state.clone());
 
@@ -243,7 +245,15 @@ async fn handle_wt_conn(st: Arc<ServerState>, conn: Connection) -> Result<()> {
         let st2 = st.clone();
         let conn3 = conn.clone();
         tokio::spawn(async move {
-            let _ = conn3.closed().await;
+            tokio::select! {
+                _ = conn3.closed() => {}
+                _ = cs2.cancel.cancelled() => {
+                    // Reaper-initiated teardown: cancel alone doesn't end the
+                    // QUIC transport (background tasks hold their own clones),
+                    // so close it explicitly.
+                    conn3.close(wtransport::VarInt::from_u32(0), b"idle conn reaped");
+                }
+            }
             cs2.cancel.cancel();
             st2.conns.remove(&cs2.id);
         });

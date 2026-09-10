@@ -73,106 +73,41 @@ CF 路由由域名的 **DNS 代理状态**决定（橙云=代理、灰云=仅 DN
 
 **推荐组合**：`--server https://灰云域`（WT 主路径保带宽）+ `--url https://灰云域/api/ppp`（直连 POST 兜底，远快于经 CF）；仅当需要隐藏源站 IP 时，才把兜底换成 `--url wss://橙云域/api/ppp`（代价是 CF 免费版链路可能很慢，实测有低至 ~50KB/s 的情形）。
 
-## 架构
+## 快速开始
 
-| 路径 | 说明 |
-|---|---|
-| **WebTransport (h3/QUIC)** | 主路径。TCP 会话 = 1 条 bidi 流；UDP = QUIC DATAGRAM（超 MTU 自动落流降级）；控制帧走首条控制流 |
-| **HTTPS POST（模式 A 降级）** | 单个双工 POST，请求/响应 Body 承载全部帧协议（TCP+UDP），SessionID 多路复用（DashMap + 有界 mpsc，容量 256） |
-| **WebSocket（模式 A 变体）** | 同一套帧协议与认证，承载在一条 WebSocket 双工通道上（`wss://`）；专供 Cloudflare 等会缓冲请求体的代理环境使用 |
-
-降级链：`WebTransport → HTTPS POST`，**按错误类型**切换：
-
-* **传输层故障**（连接断、握手超时、`too many gaps` 等协议层异常）→ 杀掉该连接并回落 HTTPS POST，会话在降级通道上重建；
-* **目标侧拒绝**（服务端拨号失败 `DialFailed`、目标非法、限额）→ 按会话直接返回错误：降级通道拨的是同一个目标、走同一个服务端，回退只会重复同样的失败，还会白白摧毁一条承载着其他会话的健康 QUIC 连接（仅限额类错误会尝试回退，因为降级通道有独立容量）。
-
-### 帧协议（20 字节定长头，小端）
-
-```
-0     1     2     4     8     12         20
-+-----+-----+-----+-----+-----+----------+
-| ver | type|flags| sid |ctlen| counter  | + ciphertext||tag
-+-----+-----+-----+-----+-----+----------+
-```
-
-* `type`：Auth / AuthOk / Open / OpenOk / OpenErr / Data / Close / Ping / Pong / UdpAssociate / UdpOk / UdpData / Error
-* `flags`：FIN（半关闭）、RST（中止）
-* AAD = 头部前 12 字节；计数器即 AEAD nonce（流通道 < 2^63，数据报通道 ≥ 2^63，保证 nonce 不重不乱）
-* 数据报接收端带 64 位滑动窗口抗重放
-
-### 加密与认证
-
-* 外层：QUIC-TLS（合法证书，标准握手）——QUIC 强制 TLS 1.3，流量全加密
-* 内层 E2E：`static_key = HKDF-SHA256(password, salt="newppp-v1", info="newppp/auth/<uid>")`；会话密钥 = HKDF(static_key, 客户端随机 salt)；ChaCha20-Poly1305
-* 双重认证：`Authorization: Bearer <uid>.<ts>.<nonce>.<HMAC>`（±60s 时间窗，饱和比较防溢出 + nonce 防重放缓存：容量 5 万，按时间戳过期自动清理，不会整表清空）+ 首帧 AUTH（静态密钥封装，携带 salt 换会话密钥）
-* **认证失败不返回 401**：WT 会话请求返回 404；HTTP 降级端点返回伪装页（200）
-* 只用标准 Header，UA 伪装 Chrome
-* 隐私边界与威胁模型取舍见下方「隐私与安全模型」章节
-
-### 会话生命周期与稳健性
-
-* **全局会话配额恰好一次释放**：配额释放与"注册句柄被移除"严格绑定——数据泵、空闲回收器、关闭帧三方竞争清理时不会重复释放或泄漏，杜绝配额漂移导致的服务器假死。
-* **半关闭语义正确**：客户端 FIN 只关闭发送方向，服务端响应可继续传完（WT 专用流与模式 A 复用通道行为一致）；只有 RST/协议错误/连接销毁才中止整条会话。
-* **数据报自愈**：单个损坏的 QUIC 数据报只丢弃其缓冲即恢复解析，不影响后续帧（防重放滑动窗口保留，不因错帧重置）。
-* **代理入站失败可见**：SOCKS5/HTTP 入站的出口拨号失败时，HTTP 代理回 `502 Bad Gateway` 而非直接断连。
-* **错误分类，连接不被误杀**：服务端拒拨等目标侧错误不会触发重连 churn；连接池 `acquire` 跳过满载连接、维护循环裁剪空载超编连接，被退役的连接会**显式关闭** QUIC 会话（不会因后台任务持有连接克隆而泄漏到服务端）。
-* 超时兜底：握手 10s、出口拨号 10s、降级 POST 响应头 30s、空闲会话按 `--idle` 回收。
-
-### 背压与容量
-
-* 背压完全依赖 QUIC 流控（本地 TCP 阻塞 → 停读 → 对端停写），不做应用层流控
-* 会话上限：客户端每连接 ≤ 50、服务端每连接 ≤ 64；连接池 1..8 条（自动补活）；全局会话上限 200（`--max-sessions`）
-* 每连接令牌桶限速（`--rate` Mbps）；空闲会话 60s 回收（`--idle`）；30s PING 保活
-* 100 并发流 × 64KB 会话缓冲 ≈ 数十 MB 内存；1Gbps 下 ChaCha20 约占 1 核
-
-## 隐私与安全模型
-
-**密码学底线两条路径等价**：所有代理帧（目标地址、payload、UDP 数据）都在内层 E2E 加密里（ChaCha20-Poly1305 + 每连接随机 salt 派生的会话密钥）——**CF 在任何情况下只能看到密文帧**，这是架构保证，不依赖 CF 的善意。"隐私"的差异在元数据层：
-
-### wss + CF（橙云）
-
-| 维度 | 状况 |
-|---|---|
-| 内容机密性 | ✅ E2E 层保证，CF 解不开帧 |
-| CF 能看到 | ⚠️ SNI/域名、**Bearer 头里的 uid（明文）**、流量大小/时序/时长 |
-| CF 看不到 | ✅ 目标主机、payload、DNS 查询、UDP 目标 |
-| 信任代价 | ⚠️ CF 是"合法中间人"：受法律强制、可记录审计——等于多信任一方 |
-| 附带收益 | ✅ 源站 IP 隐藏、L3/L4 DoS 由 CF 吸收、IP 不进 DNS 历史 |
-| 隐蔽性风险 | ⚠️ 长连 WS 双向二进制流是可指纹的代理模式；CF 可挑战/限流；免费版无 SLA |
-
-### 直连 UDP（灰云）
-
-| 维度 | 状况 |
-|---|---|
-| 内容机密性 | ✅ 同样靠 E2E 层；QUIC-TLS 端到端（自己的证书，无中间人） |
-| 元数据 | ✅ 无第三方中间人，只有两端 ISP 能看到"有 QUIC 流量到某 IP" |
-| 最大弱点 | ❌ **源站 IP 公开**：域名直接解析到 VPS，DNS 历史会永久暴露 |
-| 隐蔽性 | ❌ 主动探测可识别 quinn 指纹；跨境 UDP 常被 QoS/阻断（弱网 `too many gaps` 即此现实） |
-| DoS 面 | ❌ 源站直接暴露，L3/L4 攻击自己扛 |
-
-### 两条路径共同的真实弱点（比选路更重要）
-
-1. **密钥根是 `HKDF(password)`，不是慢哈希 KDF**（无 Argon2/PBKDF2）。攻击者捕获 bearer/AUTH 材料后可**离线爆破弱密码**——密码必须强随机，这是整个体系真正的根。
-2. 服务器本身知道一切（目标、流量），自建节点的固有边界，与传输无关。
-3. `--skip-verify` 只限调试；生产两条路径都走真实证书链，服务器身份验证完整。
-
-### 取舍结论
-
-* **内容机密性**：两者等价，前提是密码够强。
-* **元数据隐私**：直连略优（无中间人），代价是 IP 暴露 + 指纹/阻断风险。
-* **抗封锁/隐蔽性**：wss+CF 优（探测面只有一个普通网站）。
-* 组合方案见档位 2：灰云子域跑 WT 主路径 + 橙云 wss 兜底。
-
-## 构建与质量门
+### 服务端（单进程全链路，自签调试）
 
 ```bash
-cargo build --release                              # 产物 target/release/newppp
-cargo fmt --all -- --check                         # 格式检查
-cargo clippy --all-targets -- -D warnings          # 静态检查（0 警告基线）
-cargo test                                         # 单元测试（27 项，含回归测试）
+newppp -s --auth alice:secret123 --self-signed \
+  --listen          0.0.0.0:443 \    # UDP: WebTransport 主路径
+  --fallback-listen 0.0.0.0:443 \    # TCP: 伪装站 + 降级 API (h2/h1 自动协商)
+  --http-listen     0.0.0.0:80       # 80: 301 → https（可选）
 ```
 
-代码基线：无 `unsafe`、无 `#[allow]` 压制、无未用依赖；edition 2021，开发工具链 Rust 1.97（未声明 MSRV，建议用最新 stable 构建）。
+* UDP 443 与 TCP 443 不冲突，一个进程全占；防火墙放行 UDP 443 / TCP 443 / TCP 80。
+* 80 端口是纯门面：一切请求 301 → `https://同Host/原路径`（带 HSTS），明文 API 已关闭。
+* `--acme-dir /var/www/acme` 可选：在 80 上服务 Let's Encrypt http-01 验证文件（`certbot certonly --webroot -w /var/www/acme -d your.domain`），token 白名单校验防路径穿越。
+* 未认证访问 443 伪装站与降级端点，得到的都是 nginx 欢迎页风格的 200 页面。
+
+### 客户端
+
+```bash
+newppp -c --auth alice:secret123 \
+  --server https://your.domain:443 \
+  --url https://your.domain/api/ppp \
+  --bind 127.0.0.1:1080 --http-bind 127.0.0.1:8081
+```
+
+* `--server` 与 `--url` 至少配一个；两者都配时 WT 优先、失败自动降级（连续传输层故障会熔断主路径一段时间，见「架构→降级链」）。
+* **形态 B（纯网站形态）**：去掉 `--server` 只留 `--url`，并使用省略 `--listen` 的服务端（见上）；套 Cloudflare 时 `--url` 换成 `wss://`（见形态 B-CF）。
+* 自签调试加 `--skip-verify`；换成 Let's Encrypt 证书后**去掉**该参数（走系统根证书校验）。
+
+### 验证
+
+```bash
+curl --socks5-hostname 127.0.0.1:1080 https://www.google.com
+curl -x http://127.0.0.1:8081 https://www.google.com
+```
 
 ## Docker 打包（build_docker.py）
 
@@ -225,48 +160,9 @@ docker run -d -p 1080:1080 newppp-client:1.0.0
 
 * 镜像 Cmd 已含完整启动参数时，**「容器运行命令」留空保持默认**，不要填——多数管理器会把整行命令当成单个参数导致 `container startup failed`。
 * 端口映射只加 `本地端口 → 1080/TCP`（客户端）；443/udp、80 是服务端端口，客户端容器不需要。
-* 容器内必须绑 `0.0.0.0`（如 `--bind 0.0.0.0:1080`），写 127.0.0.1 会导致映射失效；SOCKS5 无认证，映射端口勿暴露公网。
+* 容器内必须绑 `0.0.0.0`（如 `--bind 0.0.0.0:1080`），写 127.0.0.1 会导致映射失效。
 * `--args` 里的密码会写进镜像配置（`docker inspect` 可见），镜像 tar 请妥善保管。
-
-已知问题：无法读取NAS证书校验，可以使用--skip-verify（应急，不推荐生产）
-
-加参数跳过校验。内层 E2E（密码派生密钥 + AEAD）仍然认证和加密，窃听者解不开流量；但失去 TLS 层服务器身份校验，中间人可以盲转发或拒绝服务。
-
-## 快速开始
-
-### 服务端（单进程全链路，自签调试）
-
-```bash
-newppp -s --auth alice:secret123 --self-signed \
-  --listen          0.0.0.0:443 \    # UDP: WebTransport 主路径
-  --fallback-listen 0.0.0.0:443 \    # TCP: 伪装站 + 降级 API (h2/h1 自动协商)
-  --http-listen     0.0.0.0:80       # 80: 301 → https（可选）
-```
-
-* UDP 443 与 TCP 443 不冲突，一个进程全占；防火墙放行 UDP 443 / TCP 443 / TCP 80。
-* 80 端口是纯门面：一切请求 301 → `https://同Host/原路径`（带 HSTS），明文 API 已关闭。
-* `--acme-dir /var/www/acme` 可选：在 80 上服务 Let's Encrypt http-01 验证文件（`certbot certonly --webroot -w /var/www/acme -d your.domain`），token 白名单校验防路径穿越。
-* 未认证访问 443 伪装站与降级端点，得到的都是 nginx 欢迎页风格的 200 页面。
-
-### 客户端
-
-```bash
-newppp -c --auth alice:secret123 \
-  --server https://your.domain:443 \
-  --url https://your.domain/api/ppp \
-  --bind 127.0.0.1:1080 --http-bind 127.0.0.1:8081
-```
-
-* `--server` 与 `--url` 至少配一个；两者都配时 WT 优先、失败自动降级。
-* **形态 B（纯网站形态）**：去掉 `--server` 只留 `--url`，并使用省略 `--listen` 的服务端（见上）；套 Cloudflare 时 `--url` 换成 `wss://`（见形态 B-CF）。
-* 自签调试加 `--skip-verify`；换成 Let's Encrypt 证书后**去掉**该参数（走系统根证书校验）。
-
-### 验证
-
-```bash
-curl --socks5-hostname 127.0.0.1:1080 https://www.google.com
-curl -x http://127.0.0.1:8081 https://www.google.com
-```
+* **已知问题：容器内无法校验证书**（scratch 基座没有系统 CA 根证书，WT/wss 均报 `UnknownIssuer`）。应急：`--skip-verify`（不推荐生产）——内层 E2E（密码派生密钥 + AEAD）仍认证加密，窃听解不开流量，但失去 TLS 层服务器身份校验，中间人可盲转发或拒绝服务。正解：把系统 CA 烤进镜像（TODO.md「快速收益」#2），客户端挂载 `SSL_CERT_FILE` 方案实测走不通。
 
 ## 生产部署
 
@@ -315,29 +211,29 @@ curl -x http://127.0.0.1:8081 https://www.google.com
 
 不想配 systemd 时，用 `screen` 把服务端挂后台（需先 `apt install screen` 或 `yum install screen`）。注意这只是简易方案：**开机不自启、崩溃不拉起**，长期运行请用上面的 systemd。
 
-**1. 创建会话并启动**（`session_name` 自取，回车后进入会话窗口，正常输入启动命令）：
+1. **创建会话并启动**：`session_name` 自取，回车后进入会话窗口，正常输入启动命令：
 
-```bash
-screen -S newppp
-newppp -s --auth alice:secret123 --listen 0.0.0.0:443 \
-  --fallback-listen 0.0.0.0:443 --http-listen 0.0.0.0:80 \
-  --cert /etc/newppp/cert.pem --key /etc/newppp/key.pem
-```
+   ```bash
+   screen -S newppp
+   newppp -s --auth alice:secret123 --listen 0.0.0.0:443 \
+     --fallback-listen 0.0.0.0:443 --http-listen 0.0.0.0:80 \
+     --cert /etc/newppp/cert.pem --key /etc/newppp/key.pem
+   ```
 
-**2. 分离会话**：按 `Ctrl+a` 再按 `d`——暂时退出窗口，进程继续在后台跑，可安全断开 SSH。
+2. **分离会话**：按 `Ctrl+a` 再按 `d`——暂时退出窗口，进程继续在后台跑，可安全断开 SSH。
 
-**3. 重新连接**：
+3. **重新连接**：
 
-```bash
-screen -r newppp     # 回到会话（即可看到服务端日志）
-screen -ls           # 列出所有会话
-```
+   ```bash
+   screen -r newppp     # 回到会话（即可看到服务端日志）
+   screen -ls           # 列出所有会话
+   ```
 
-**4. 关闭会话/停止服务**：`screen -r newppp` 回到会话后，`Ctrl+C` 停掉服务端，再输入 `exit` 关闭会话；或一步到位（不进会话直接杀掉）：
+4. **关闭会话/停止服务**：`screen -r newppp` 回到会话后，`Ctrl+C` 停掉服务端，再输入 `exit` 关闭会话；或一步到位（不进会话直接杀掉）：
 
-```bash
-screen -S newppp -X quit
-```
+   ```bash
+   screen -S newppp -X quit
+   ```
 
 客户端同理：把启动命令换成 `-c ...` 参数即可。
 
@@ -399,6 +295,7 @@ newppp -c --auth alice:secret123 \
 | `--max-sessions` | 200 | 全局并发会话上限 |
 | `--rate` | 100 | 每连接限速 Mbps（0 不限） |
 | `--idle` | 60 | 空闲会话回收秒数 |
+| `--recv-window` | 2 | QUIC 每流接收窗口 MB（1..=64，上传方向） |
 | `--log` | info | 日志级别（trace/debug/info/warn/error） |
 
 ## 客户端参数
@@ -411,21 +308,124 @@ newppp -c --auth alice:secret123 \
 | `--bind` | 127.0.0.1:1080 | SOCKS5 监听（CONNECT / UDP ASSOCIATE） |
 | `--http-bind` | - | HTTP 代理监听（CONNECT + 简单转发，出口失败回 502） |
 | `--conns` | 2 | 连接池大小（1..8） |
+| `--recv-window` | 2 | QUIC 每流接收窗口 MB（1..=64，下载方向）：优质高延迟线路可调大提速，高丢包调小抗 `too many gaps` |
 | `--skip-verify` | off | 跳过证书校验（仅调试） |
 | `--log` | info | 日志级别（trace/debug/info/warn/error） |
+
+## 架构
+
+| 路径 | 说明 |
+|---|---|
+| **WebTransport (h3/QUIC)** | 主路径。TCP 会话 = 1 条 bidi 流；UDP = QUIC DATAGRAM（超 MTU 自动落流降级）；控制帧走首条控制流 |
+| **HTTPS POST（模式 A 降级）** | 单个双工 POST，请求/响应 Body 承载全部帧协议（TCP+UDP），SessionID 多路复用（DashMap + 有界 mpsc，容量 256） |
+| **WebSocket（模式 A 变体）** | 同一套帧协议与认证，承载在一条 WebSocket 双工通道上（`wss://`）；专供 Cloudflare 等会缓冲请求体的代理环境使用 |
+
+降级链：`WebTransport → HTTPS POST`，**按错误类型**切换：
+
+* **传输层故障**（连接断、握手超时、`too many gaps` 等协议层异常）→ 杀掉该连接并回落 HTTPS POST，会话在降级通道上重建；
+* **目标侧拒绝**（服务端拨号失败 `DialFailed`、目标非法、限额）→ 按会话直接返回错误：降级通道拨的是同一个目标、走同一个服务端，回退只会重复同样的失败，还会白白摧毁一条承载着其他会话的健康 QUIC 连接（仅限额类错误会尝试回退，因为降级通道有独立容量）；
+* **熔断器**：连续 3 次传输层故障后主路径熔断 60s，期间新会话直接走兜底、零试错；到期放行一次探测，成功恢复、失败立即再熔断。目标侧拒绝不计入——那说明传输本身是健康的。
+
+### 帧协议（20 字节定长头，小端）
+
+```
+0     1     2     4     8     12         20
++-----+-----+-----+-----+-----+----------+
+| ver | type|flags| sid |ctlen| counter  | + ciphertext||tag
++-----+-----+-----+-----+-----+----------+
+```
+
+* `type`：Auth / AuthOk / Open / OpenOk / OpenErr / Data / Close / Ping / Pong / UdpAssociate / UdpOk / UdpData / Error
+* `flags`：FIN（半关闭）、RST（中止）
+* AAD = 头部前 12 字节；计数器即 AEAD nonce（流通道 < 2^63，数据报通道 ≥ 2^63，保证 nonce 不重不乱）
+* 数据报接收端带 64 位滑动窗口抗重放
+
+### 加密与认证
+
+* 外层：QUIC-TLS（合法证书，标准握手）——QUIC 强制 TLS 1.3，流量全加密
+* 内层 E2E：`static_key = HKDF-SHA256(password, salt="newppp-v1", info="newppp/auth/<uid>")`；会话密钥 = HKDF(static_key, 客户端随机 salt)；ChaCha20-Poly1305
+* 双重认证：`Authorization: Bearer <uid>.<ts>.<nonce>.<HMAC>`（±60s 时间窗，饱和比较防溢出 + nonce 防重放缓存：同一 token 只接受一次；容量 5 万，按时间戳过期自动清理，不会整表清空）+ 首帧 AUTH（静态密钥封装，携带 salt 换会话密钥，nonce 同样防重放）
+* **认证失败不返回 401**：WT 会话请求返回 404；HTTP 降级端点返回伪装页（200）
+* 只用标准 Header，UA 伪装 Chrome
+* 隐私边界与威胁模型取舍见下方「隐私与安全模型」章节
+
+### 会话生命周期与稳健性
+
+* **全局会话配额恰好一次释放**：配额释放与"注册句柄被移除"严格绑定——数据泵、空闲回收器、关闭帧三方竞争清理时不会重复释放或泄漏，杜绝配额漂移导致的服务器假死。
+* **半关闭语义正确**：客户端 FIN 只关闭发送方向，服务端响应可继续传完（WT 专用流与模式 A 复用通道行为一致）；只有 RST/协议错误/连接销毁才中止整条会话。
+* **数据报自愈**：单个损坏的 QUIC 数据报只丢弃其缓冲即恢复解析，不影响后续帧（防重放滑动窗口保留，不因错帧重置）。
+* **代理入站失败可见**：SOCKS5/HTTP 入站的出口拨号失败时，HTTP 代理回 `502 Bad Gateway` 而非直接断连。
+* **错误分类，连接不被误杀**：服务端拒拨等目标侧错误不会触发重连 churn；连接池 `acquire` 跳过满载连接、维护循环裁剪空载超编连接，被退役的连接会**显式关闭** QUIC 会话（不会因后台任务持有连接克隆而泄漏到服务端）。
+* 超时兜底：握手 10s、出口拨号 10s、降级 POST 响应头 30s、空闲会话按 `--idle` 回收。
+
+### 背压与容量
+
+* 背压完全依赖 QUIC 流控（本地 TCP 阻塞 → 停读 → 对端停写），不做应用层流控
+* 会话上限：客户端每连接 ≤ 50、服务端每连接 ≤ 64；连接池 1..8 条（自动补活）；全局会话上限 200（`--max-sessions`）
+* 每连接令牌桶限速（`--rate` Mbps）；空闲会话 60s 回收（`--idle`）；无会话且无数据活动的空连接 3×`--idle` 回收（keepalive Pings 不计入，服务端主动关闭 QUIC，客户端自动重连）；30s PING 保活
+* 100 并发流 × 64KB 会话缓冲 ≈ 数十 MB 内存；1Gbps 下 ChaCha20 约占 1 核
+
+## 隐私与安全模型
+
+**密码学底线两条路径等价**：所有代理帧（目标地址、payload、UDP 数据）都在内层 E2E 加密里（ChaCha20-Poly1305 + 每连接随机 salt 派生的会话密钥）——**CF 在任何情况下只能看到密文帧**，这是架构保证，不依赖 CF 的善意。"隐私"的差异在元数据层：
+
+### wss + CF（橙云）
+
+| 维度 | 状况 |
+|---|---|
+| 内容机密性 | ✅ E2E 层保证，CF 解不开帧 |
+| CF 能看到 | ⚠️ SNI/域名、**Bearer 头里的 uid（明文）**、流量大小/时序/时长 |
+| CF 看不到 | ✅ 目标主机、payload、DNS 查询、UDP 目标 |
+| 信任代价 | ⚠️ CF 是"合法中间人"：受法律强制、可记录审计——等于多信任一方 |
+| 附带收益 | ✅ 源站 IP 隐藏、L3/L4 DoS 由 CF 吸收、IP 不进 DNS 历史 |
+| 隐蔽性风险 | ⚠️ 长连 WS 双向二进制流是可指纹的代理模式；CF 可挑战/限流；免费版无 SLA |
+
+### 直连 UDP（灰云）
+
+| 维度 | 状况 |
+|---|---|
+| 内容机密性 | ✅ 同样靠 E2E 层；QUIC-TLS 端到端（自己的证书，无中间人） |
+| 元数据 | ✅ 无第三方中间人，只有两端 ISP 能看到"有 QUIC 流量到某 IP" |
+| 最大弱点 | ❌ **源站 IP 公开**：域名直接解析到 VPS，DNS 历史会永久暴露 |
+| 隐蔽性 | ❌ 主动探测可识别 quinn 指纹；跨境 UDP 常被 QoS/阻断（弱网 `too many gaps` 即此现实） |
+| DoS 面 | ❌ 源站直接暴露，L3/L4 攻击自己扛 |
+
+### 两条路径共同的真实弱点（比选路更重要）
+
+1. **密钥根是 `HKDF(password)`，不是慢哈希 KDF**（无 Argon2/PBKDF2）。攻击者捕获 bearer/AUTH 材料后可**离线爆破弱密码**——密码必须强随机，这是整个体系真正的根。
+2. 服务器本身知道一切（目标、流量），自建节点的固有边界，与传输无关。
+3. `--skip-verify` 只限调试；生产两条路径都走真实证书链，服务器身份验证完整。
+
+### 取舍结论
+
+* **内容机密性**：两者等价，前提是密码够强。
+* **元数据隐私**：直连略优（无中间人），代价是 IP 暴露 + 指纹/阻断风险。
+* **抗封锁/隐蔽性**：wss+CF 优（探测面只有一个普通网站）。
+* 组合方案见档位 2：灰云子域跑 WT 主路径 + 橙云 wss 兜底。
 
 ## 已知限制 / 风险
 
 * **套 Cloudflare 时不要配 `--server`（WT 主路径）**：CF 边缘接受 h3 但不支持 WebTransport，会重置 WT 会话流——旧版 wtransport(0.6) 会因此 panic（0.7.2 已修复，重置被正常归类为连接错误并自动回落）；CF 后请用 `--url wss://`（见档位 2）。
-
 * `--listen` 提供时仅端口生效（wtransport 绑定 API 限制），总是绑定全部接口；需要限定地址时用防火墙/iptables 收敛，或省略 `--listen` 完全不监听 UDP。
 * 服务端对未认证连接数无显式上限（依赖 QUIC/TLS 层自身的限流）。
 * quinn 的 QUIC/TLS 指纹与 Chrome 不同；主动 QUIC 指纹探测可区分（被动分类无特征）。
-* `too many gaps in stream buffer`：quinn 对流重组缓冲乱序空洞数的内部保护，丢包/乱序严重的弱网 UDP 链路 + 大接收窗口下会触发，触发后该连接中止、会话自动回落 HTTPS POST。接收窗口默认已调为 2MB（`src/quic_tune.rs`，2MB ≈ 5 倍碎片余量，300ms RTT 单流 ≈ 53Mbps）；若仍受影响可进一步调小。
-* UDP 443 不应答普通 h3 GET（也不发 Alt-Svc）：浏览器不会来（无 Alt-Svc），但定制探测工具可发现"这个 QUIC 服务不是网页"；WT 握手探测则得到 404，与"不支持 WT 的普通源"一致。根治需换 quinn+h3 栈实现 GET/WT 同端口共宿——留作后续演进。
+* `too many gaps in stream buffer`：quinn 对流重组缓冲乱序空洞数的内部保护，丢包/乱序严重的弱网 UDP 链路 + 大接收窗口下会触发，触发后该连接中止、会话自动回落 HTTPS POST。接收窗口默认 2MB（300ms RTT 单流 ≈ 53Mbps），可用 `--recv-window` 调节（1..=64 MB）：高丢包调小（如 1）、优质高延迟线路调大提速。
+* **WT 主路径熔断**：连续 3 次传输层故障（连接被杀、握手失败等）后熔断 60s，期间新会话直接走兜底不再试错；到期放行一次探测，成功恢复、失败立即再熔断。目标侧拒绝（拨号失败/限额）不计入——那是传输健康、目标不可达。
+* UDP 443 不应答普通 h3 GET（也不发 Alt-Svc）：浏览器不会来（无 Alt-Svc），但定制探测工具可发现"这个 QUIC 服务不是网页"；WT 握手探测则得到 404，与"不支持 WT 的普通源"一致。根治需换 quinn+h3 栈实现 GET/WT 同端口共宿——留作后续演进（TODO.md「暂缓项」）。
 * 流量形态：长连接多流持续传输（像视频会议/云盘），内容级分析对任何形态都有告警可能。
 * 降级路径（模式 A）依赖 nginx 关闭缓冲；本实现已发送 `X-Accel-Buffering: no`。
 * UDP 数据报 >路径 MTU 时自动改走可靠流（PMTUD 上限 ~1200B 设计）；形态 B 下 UDP 全走可靠流。
+
+## 构建与质量门
+
+```bash
+cargo build --release                              # 产物 target/release/newppp
+cargo fmt --all -- --check                         # 格式检查
+cargo clippy --all-targets -- -D warnings          # 静态检查（0 警告基线）
+cargo test                                         # 单元测试（34 项，含回归测试）
+```
+
+代码基线：无 `unsafe`、无 `#[allow]` 压制、无未用依赖；edition 2021，开发工具链 Rust 1.97（未声明 MSRV，建议用最新 stable 构建）。
 
 ## 目录结构
 
@@ -433,7 +433,7 @@ newppp -c --auth alice:secret123 \
 src/
 ├── main.rs            # 入口：-c/-s 分发
 ├── config.rs          # CLI 与运行时配置
-├── quic_tune.rs       # 共享 QUIC 传输调优（大窗口 + BBR 拥塞控制）
+├── quic_tune.rs       # 共享 QUIC 传输调优（可调窗口 + BBR 拥塞控制）
 ├── proto/             # 共享协议层
 │   ├── frame.rs       #   帧编解码（头/AAD/计数器/滑动窗口/异步读写器/坏帧恢复）
 │   ├── crypto.rs      #   HKDF 派生、ChaCha20-Poly1305、Bearer/AUTH、防重放
@@ -441,7 +441,7 @@ src/
 │   ├── mux.rs         #   模式 A 多路复用器（客户端角色 + 服务端角色 + FrameSink）
 │   └── stream.rs      #   字节流 → AsyncRead 桥接（POST body / WS 消息共用）
 ├── client/
-│   ├── outbound.rs    #   出口选择与自动降级
+│   ├── outbound.rs    #   出口选择、熔断器与自动降级
 │   ├── wt.rs          #   WebTransport 连接池/控制流/专用流/datagram
 │   ├── fallback.rs    #   HTTPS POST 降级出口（hyper + rustls）
 │   ├── socks5.rs      #   SOCKS5 入站（CONNECT / UDP ASSOCIATE）

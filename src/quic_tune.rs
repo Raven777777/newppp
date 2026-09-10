@@ -5,24 +5,24 @@
 //! * CUBIC congestion control — collapses to ~60KB/s at 1% loss / 300ms RTT
 //!
 //! We raise the windows and switch to BBR, which sustains throughput on
-//! lossy, high-latency paths.
+//! lossy, high-latency paths. The receive window is CLI-tunable
+//! (`--recv-window`, default 2MB): on lossy paths a big window lets too many
+//! out-of-order fragments accumulate and trips quinn's "too many gaps"
+//! protection, which aborts the whole connection mid-transfer.
 
 use std::sync::Arc;
 
 use quinn_proto::VarInt;
 use wtransport::config::QuicTransportConfig;
 
-pub fn tuned() -> QuicTransportConfig {
+pub fn tuned(recv_window: u32) -> QuicTransportConfig {
     let mut t = QuicTransportConfig::default();
 
-    // Per-stream receive window (quinn default ~1.2MB).
-    //
-    // 2MB, not larger: on lossy paths (cross-border UDP) a big window lets
-    // too many out-of-order fragments accumulate and trips quinn's
-    // "too many gaps in stream buffer" protection, which aborts the whole
-    // connection mid-download. 2MB keeps ~5x headroom below that limit
-    // while still allowing ~50Mbps per stream at 300ms RTT.
-    t.stream_receive_window(VarInt::from(2 * 1024 * 1024u32));
+    // Per-stream receive window (quinn default ~1.2MB). The 2MB default
+    // keeps ~5x headroom below quinn's reassembly-gap limit while still
+    // allowing ~50Mbps per stream at 300ms RTT; raise it on clean
+    // high-BDP links, lower it on very lossy ones.
+    t.stream_receive_window(VarInt::from(recv_window));
     // Total bytes in flight per stream without peer acknowledgement.
     t.send_window(32 * 1024 * 1024);
 

@@ -498,9 +498,10 @@ mod tests {
     use super::*;
     use crate::proto::crypto::FrameCipher;
     use crate::proto::mux::FrameSink;
+    use crate::server::state::now_millis;
     use dashmap::DashMap;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
     fn setup() -> (Arc<ServerState>, Arc<ConnState>) {
         use crate::server::limit::RateLimiter;
@@ -526,6 +527,7 @@ mod tests {
             tcp_routes: Default::default(),
             udp_routes: Default::default(),
             max_per_conn: 8,
+            last_active: AtomicI64::new(now_millis()),
         });
         st.conns.insert(1, conn.clone());
         (st, conn)
