@@ -1,6 +1,6 @@
 # newppp
 
-工业级 WebTransport (QUIC/HTTP-3) 代理。同一二进制以 `-c` / `-s` 区分客户端与服务端。
+WebTransport (QUIC/HTTP-3) 代理。
 
 ```
 客户端 (SOCKS5/HTTP 代理)                          服务端
