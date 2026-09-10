@@ -1,0 +1,36 @@
+[Unit]
+Description=newppp server (WebTransport proxy)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=newppp
+Group=newppp
+# 直跑档位3（后端直出 TLS）：
+# ExecStart=/usr/local/bin/newppp -s --auth alice:secret123 --listen 0.0.0.0:443 --cert /etc/newppp/cert.pem --key /etc/newppp/key.pem
+# nginx 前置档位1（仅回源，TLS 由 nginx 终止时后端仍需 TLS 证书用于 QUIC）：
+ExecStart=/usr/local/bin/newppp -s \
+  --auth alice:secret123 \
+  --auth bob:hunter2 \
+  --listen 127.0.0.1:8443 \
+  --fallback-listen 127.0.0.1:8444 \
+  --path /api/ppp \
+  --cert /etc/newppp/cert.pem \
+  --key /etc/newppp/key.pem \
+  --max-sessions 200 \
+  --rate 100 \
+  --idle 60 \
+  --log info
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+
+# 加固
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
