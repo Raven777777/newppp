@@ -18,6 +18,8 @@ use std::sync::Arc;
 pub const SALT_LEN: usize = 16;
 pub const KEY_LEN: usize = 32;
 pub const MAC_LEN: usize = 32;
+/// ChaCha20-Poly1305 authentication tag length.
+pub const TAG_LEN: usize = 16;
 /// Bearer token timestamp tolerance (seconds, +/-).
 pub const AUTH_WINDOW: u64 = 60;
 
@@ -59,22 +61,35 @@ impl FrameCipher {
         }
     }
 
-    /// Encrypt `plaintext`, returns ciphertext || 16-byte tag.
-    pub fn seal(&self, counter: u64, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
-        let mut buf = plaintext.to_vec();
+    /// Encrypt `buf` in place and return the detached tag (not appended).
+    /// Lets callers encrypt directly inside a pre-sized buffer, avoiding the
+    /// intermediate `Vec` allocation and copy of [`FrameCipher::seal`].
+    pub fn seal_slice(&self, counter: u64, aad: &[u8], buf: &mut [u8]) -> Result<[u8; TAG_LEN]> {
         let tag = self
             .aead
-            .encrypt_in_place_detached(&nonce_for(counter), aad, &mut buf)
+            .encrypt_in_place_detached(&nonce_for(counter), aad, buf)
             .map_err(|_| anyhow::anyhow!("aead seal failed"))?;
-        buf.extend_from_slice(tag.as_slice());
+        let mut out = [0u8; TAG_LEN];
+        out.copy_from_slice(tag.as_slice());
+        Ok(out)
+    }
+
+    /// Encrypt `plaintext`, returns ciphertext || 16-byte tag (single
+    /// allocation: capacity is exact, so appending the tag never reallocs).
+    pub fn seal(&self, counter: u64, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
+        let mut buf = Vec::with_capacity(plaintext.len() + TAG_LEN);
+        buf.extend_from_slice(plaintext);
+        let tag = self.seal_slice(counter, aad, &mut buf)?;
+        buf.extend_from_slice(&tag);
         Ok(buf)
     }
 
     /// Decrypt `ciphertext` (payload || tag), returns plaintext.
     pub fn open(&self, counter: u64, aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
-        ensure!(ciphertext.len() >= 16, "ciphertext too short");
-        let (buf, tag) = ciphertext.split_at(ciphertext.len() - 16);
-        let mut buf = buf.to_vec();
+        ensure!(ciphertext.len() >= TAG_LEN, "ciphertext too short");
+        let (ct, tag) = ciphertext.split_at(ciphertext.len() - TAG_LEN);
+        let mut buf = Vec::with_capacity(ct.len());
+        buf.extend_from_slice(ct);
         self.aead
             .decrypt_in_place_detached(
                 &nonce_for(counter),
@@ -119,6 +134,12 @@ impl CounterGen {
 pub struct ReplayWindow {
     highest: u64,
     mask: u64,
+}
+
+impl Default for ReplayWindow {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ReplayWindow {
@@ -431,5 +452,48 @@ mod tests {
             ..ap.clone()
         };
         assert!(!old.verify(&key, AUTH_WINDOW));
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn unhex_roundtrips_hex(bytes in proptest::collection::vec(any::<u8>(), 0..64)) {
+            prop_assert_eq!(unhex(&hex(&bytes)), Some(bytes));
+        }
+
+        #[test]
+        fn unhex_never_panics(s in ".*") {
+            let _ = unhex(&s);
+        }
+
+        /// The decoder is the first layer facing hostile input: any byte
+        /// sequence must yield a value (or error), never a panic.
+        #[test]
+        fn auth_payload_decode_never_panics(b in proptest::collection::vec(any::<u8>(), 0..256)) {
+            let _ = AuthPayload::decode(&b);
+        }
+
+        #[test]
+        fn auth_payload_encode_decode_roundtrip(
+            salt in proptest::array::uniform16(any::<u8>()),
+            nonce in proptest::array::uniform16(any::<u8>()),
+            ts in any::<u64>(),
+            uid in "[A-Za-z0-9_-]{1,32}",
+        ) {
+            let key = derive_static_key("pw", &uid);
+            let mac = auth_mac(&key, &uid, ts, &nonce);
+            let ap = AuthPayload { salt, ts, nonce, uid: uid.clone(), mac };
+            let dec = AuthPayload::decode(&ap.encode()).expect("valid encoding");
+            prop_assert_eq!(dec.salt, salt);
+            prop_assert_eq!(dec.ts, ts);
+            prop_assert_eq!(dec.nonce, nonce);
+            prop_assert_eq!(dec.uid, uid);
+            prop_assert_eq!(dec.mac, mac);
+        }
     }
 }

@@ -132,6 +132,12 @@ pub struct UdpRelay {
     pub v6: tokio::sync::OnceCell<Arc<tokio::net::UdpSocket>>,
 }
 
+impl Default for UdpRelay {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UdpRelay {
     pub fn new() -> Self {
         Self {

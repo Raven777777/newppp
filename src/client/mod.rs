@@ -12,6 +12,18 @@ use tracing::info;
 use crate::config::ClientConfig;
 use outbound::Outbound;
 
+/// Constant-time byte comparison (used for local inbound credentials).
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 pub async fn run(cfg: ClientConfig) -> Result<()> {
     let ob = Outbound::build(&cfg).await?;
     info!("newppp client up (outbound: {})", ob.describe());
@@ -19,13 +31,17 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
     let socks = tokio::spawn({
         let ob = ob.clone();
         let bind = cfg.socks_bind.clone();
-        async move { socks5::run(bind, ob).await }
+        let auth = cfg.inbound_auth.clone();
+        async move { socks5::run(bind, ob, auth).await }
     });
 
     let mut http_task = None;
     if let Some(hb) = cfg.http_bind.clone() {
         let ob = ob.clone();
-        http_task = Some(tokio::spawn(async move { http_proxy::run(hb, ob).await }));
+        let auth = cfg.inbound_auth.clone();
+        http_task = Some(tokio::spawn(
+            async move { http_proxy::run(hb, ob, auth).await },
+        ));
     }
 
     tokio::select! {

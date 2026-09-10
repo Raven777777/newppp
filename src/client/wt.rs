@@ -4,7 +4,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
@@ -80,10 +80,19 @@ impl WtPool {
 
     /// Background maintenance: drop dead conns, keep the pool warm, trim
     /// surplus idle conns.
+    ///
+    /// Refills use exponential backoff (10s → 20s → … → 5min) while the
+    /// server is unreachable, resetting as soon as a dial succeeds. This is
+    /// both more polite and less fingerprintable than a fixed 10s retry.
     pub fn spawn_maintenance(self: &Arc<Self>) {
+        const BASE_BACKOFF: Duration = Duration::from_secs(10);
+        const MAX_BACKOFF: Duration = Duration::from_secs(300);
+
         let this = self.clone();
         tokio::spawn(async move {
-            let mut iv = tokio::time::interval(Duration::from_secs(10));
+            let mut iv = tokio::time::interval(BASE_BACKOFF);
+            let mut backoff = BASE_BACKOFF;
+            let mut next_attempt = Instant::now();
             loop {
                 iv.tick().await;
                 let alive_now = {
@@ -105,16 +114,34 @@ impl WtPool {
                     g.len()
                 };
                 let need = this.cfg.size.saturating_sub(alive_now);
+                if need == 0 {
+                    // Pool healthy again: reset the backoff.
+                    backoff = BASE_BACKOFF;
+                    next_attempt = Instant::now();
+                    continue;
+                }
+                if Instant::now() < next_attempt {
+                    continue; // still cooling down after failed dials
+                }
+                // Dial sequentially so success/failure is observed here and
+                // the backoff reflects reality (spawned dials cannot report).
+                let mut any_ok = false;
                 for _ in 0..need {
-                    let this2 = this.clone();
-                    tokio::spawn(async move {
-                        match WtConn::connect(&this2.cfg, &this2.endpoint).await {
-                            Ok(c) => {
-                                this2.conns.lock().await.push(c);
-                            }
-                            Err(e) => debug!("pool maintenance connect failed: {e:#}"),
+                    match WtConn::connect(&this.cfg, &this.endpoint).await {
+                        Ok(c) => {
+                            this.conns.lock().await.push(c);
+                            any_ok = true;
                         }
-                    });
+                        Err(e) => debug!("pool maintenance connect failed: {e:#}"),
+                    }
+                }
+                if any_ok {
+                    backoff = BASE_BACKOFF;
+                    next_attempt = Instant::now();
+                } else {
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                    next_attempt = Instant::now() + backoff;
+                    debug!("pool maintenance backing off for {backoff:?}");
                 }
             }
         });
@@ -204,7 +231,10 @@ fn build_tls_config(skip_verify: bool, recv_window: u32) -> Result<WtClientConfi
 }
 
 impl WtConn {
-    pub async fn connect(cfg: &PoolCfg, endpoint: &Endpoint<WtClientSide>) -> Result<Arc<WtConn>> {
+    pub(crate) async fn connect(
+        cfg: &PoolCfg,
+        endpoint: &Endpoint<WtClientSide>,
+    ) -> Result<Arc<WtConn>> {
         // Fresh bearer per connection: the token embeds a timestamp checked
         // with a +/-60s window on the server, so reusing one minted at pool
         // creation would get later connections rejected.

@@ -462,6 +462,13 @@ async fn handle_client_frame(inner: &Arc<MuxInner>, f: super::frame::Frame) -> b
                     inner.sessions.remove(&f.sid);
                 }
             }
+            if f.flags & FLAG_FIN != 0 {
+                // Half-close from the server: drop the session sender so the
+                // user->frames pump observes channel closure and shuts the
+                // local stream's write side down (same as the WT path). The
+                // final payload was queued above, so ordering is preserved.
+                inner.sessions.remove(&f.sid);
+            }
             false
         }
         FrameType::Close => {
@@ -591,7 +598,15 @@ async fn handle_server_frame(
         }
         FrameType::Close => {
             let rst = f.flags & FLAG_RST != 0;
-            hooks.close_tcp(f.sid, rst);
+            let fin = f.flags & FLAG_FIN != 0;
+            if fin && !rst {
+                // Half-close: stop the client->target direction only and let
+                // the target->client pump own teardown, matching the WT path.
+                // A full teardown here would truncate the response.
+                hooks.feed_tcp(f.sid, Vec::new(), true, false).await;
+            } else {
+                hooks.close_tcp(f.sid, rst);
+            }
         }
         FrameType::Ping => {
             let _ = sink.send(FrameType::Pong, 0, 0, &[]).await;
@@ -620,5 +635,126 @@ async fn handle_server_frame(
             hooks.close_tcp(f.sid, true);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::frame::Frame;
+    use std::sync::atomic::AtomicU32;
+    use std::sync::Mutex;
+
+    fn data_frame(flags: u16, sid: u32, payload: &[u8]) -> Frame {
+        Frame {
+            ftype: FrameType::Data,
+            flags,
+            sid,
+            counter: 0,
+            aad: [0u8; 12],
+            payload: payload.to_vec(),
+        }
+    }
+
+    fn close_frame(flags: u16, sid: u32) -> Frame {
+        Frame {
+            ftype: FrameType::Close,
+            flags,
+            sid,
+            counter: 0,
+            aad: [0u8; 12],
+            payload: Vec::new(),
+        }
+    }
+
+    fn test_inner() -> Arc<MuxInner> {
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<OutFrame>(4);
+        Arc::new(MuxInner {
+            cmd_tx,
+            sessions: dashmap::DashMap::new(),
+            udp: dashmap::DashMap::new(),
+            pending_open: dashmap::DashMap::new(),
+            pending_udp: dashmap::DashMap::new(),
+            next_sid: AtomicU32::new(1),
+            closed: CancellationToken::new(),
+        })
+    }
+
+    /// A Data frame with FLAG_FIN must deliver its payload and then close the
+    /// session sender so the local user stream sees EOF (mode-A target EOF).
+    #[tokio::test]
+    async fn client_data_fin_closes_session() {
+        let inner = test_inner();
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
+        inner.sessions.insert(7, tx);
+
+        assert!(!handle_client_frame(&inner, data_frame(FLAG_FIN, 7, b"last")).await);
+        assert_eq!(rx.recv().await.as_deref(), Some(&b"last"[..]));
+        assert!(rx.recv().await.is_none(), "sender must be dropped on FIN");
+        assert!(inner.sessions.get(&7).is_none());
+    }
+
+    /// A plain Data frame (no FIN) keeps the session open.
+    #[tokio::test]
+    async fn client_data_without_fin_keeps_session() {
+        let inner = test_inner();
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
+        inner.sessions.insert(7, tx);
+
+        assert!(!handle_client_frame(&inner, data_frame(0, 7, b"chunk")).await);
+        assert_eq!(rx.recv().await.as_deref(), Some(&b"chunk"[..]));
+        assert!(inner.sessions.get(&7).is_some());
+    }
+
+    #[derive(Default)]
+    struct MockHooks {
+        feeds: Mutex<Vec<(u32, bool, bool)>>,
+        closes: Mutex<Vec<(u32, bool)>>,
+    }
+
+    impl ServerHooks for MockHooks {
+        fn open_tcp(&self, _sid: u32, _host: String, _port: u16) -> BoxFutOpen {
+            Box::pin(async { Ok(()) })
+        }
+        fn feed_tcp(&self, sid: u32, _data: Vec<u8>, fin: bool, rst: bool) -> BoxFutUnit {
+            self.feeds.lock().unwrap().push((sid, fin, rst));
+            Box::pin(async {})
+        }
+        fn close_tcp(&self, sid: u32, rst: bool) {
+            self.closes.lock().unwrap().push((sid, rst));
+        }
+        fn udp_associate(&self, _sid: u32, _sink: FrameSink) -> BoxFutOpen {
+            Box::pin(async { Ok(()) })
+        }
+        fn udp_feed(&self, _sid: u32, _dst: UdpAddr, _data: Vec<u8>) -> BoxFutUnit {
+            Box::pin(async {})
+        }
+        fn touch(&self, _sid: u32) {}
+    }
+
+    fn test_sink() -> FrameSink {
+        FrameSink::Chan(mpsc::channel(1).0)
+    }
+
+    /// Close+FIN from the client is a half-close: route it to `feed_tcp` and
+    /// leave teardown to the target->client pump (WT parity).
+    #[tokio::test]
+    async fn server_close_fin_is_half_close() {
+        let hooks = Arc::new(MockHooks::default());
+        let dyn_hooks: Arc<dyn ServerHooks> = hooks.clone();
+        handle_server_frame(&test_sink(), &dyn_hooks, close_frame(FLAG_FIN, 3)).await;
+        assert_eq!(*hooks.feeds.lock().unwrap(), vec![(3, true, false)]);
+        assert!(hooks.closes.lock().unwrap().is_empty());
+    }
+
+    /// Close+RST (and flag-less Close) must tear the session down.
+    #[tokio::test]
+    async fn server_close_rst_tears_down() {
+        let hooks = Arc::new(MockHooks::default());
+        let dyn_hooks: Arc<dyn ServerHooks> = hooks.clone();
+        handle_server_frame(&test_sink(), &dyn_hooks, close_frame(FLAG_RST, 3)).await;
+        handle_server_frame(&test_sink(), &dyn_hooks, close_frame(0, 4)).await;
+        assert_eq!(*hooks.closes.lock().unwrap(), vec![(3, true), (4, false)]);
+        assert!(hooks.feeds.lock().unwrap().is_empty());
     }
 }

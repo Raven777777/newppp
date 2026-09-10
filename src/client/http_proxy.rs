@@ -19,21 +19,30 @@ async fn reply_error(sock: &mut tokio::net::TcpStream) {
         .await;
 }
 
-pub async fn run(bind: String, ob: Outbound) -> Result<()> {
+pub async fn run(bind: String, ob: Outbound, auth: Option<(String, String)>) -> Result<()> {
     let listener = TcpListener::bind(&bind).await?;
-    info!("HTTP proxy listening on {bind}");
+    if auth.is_some() {
+        info!("HTTP proxy listening on {bind} (Basic auth required)");
+    } else {
+        info!("HTTP proxy listening on {bind}");
+    }
     loop {
         let (sock, peer) = listener.accept().await?;
         let ob = ob.clone();
+        let auth = auth.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(sock, ob).await {
+            if let Err(e) = handle(sock, ob, auth).await {
                 debug!("http proxy conn from {peer} ended: {e:#}");
             }
         });
     }
 }
 
-async fn handle(mut sock: tokio::net::TcpStream, ob: Outbound) -> Result<()> {
+async fn handle(
+    mut sock: tokio::net::TcpStream,
+    ob: Outbound,
+    auth: Option<(String, String)>,
+) -> Result<()> {
     let mut buf = BytesMut::new();
     // read until end of request head
     let head_end = loop {
@@ -58,6 +67,19 @@ async fn handle(mut sock: tokio::net::TcpStream, ob: Outbound) -> Result<()> {
     let method = parts.next().unwrap_or_default().to_string();
     let target = parts.next().unwrap_or_default().to_string();
     let _version = parts.next().unwrap_or_default();
+
+    if let Some((user, pass)) = &auth {
+        if !proxy_auth_ok(&head, user, pass) {
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+                      Proxy-Authenticate: Basic realm=\"newppp\"\r\n\
+                      Content-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            anyhow::bail!("proxy authentication required");
+        }
+    }
 
     if method.eq_ignore_ascii_case("CONNECT") {
         let (host, port) = parse_host_port(&target, 443)?;
@@ -150,6 +172,37 @@ fn find_double_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
+/// Validate a `Proxy-Authorization: Basic <base64(user:pass)>` header.
+fn proxy_auth_ok(head: &str, user: &str, pass: &str) -> bool {
+    use base64::Engine as _;
+
+    for line in head.split("\r\n").skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("proxy-authorization") {
+            continue;
+        }
+        let value = value.trim();
+        let Some((scheme, b64)) = value.split_once(' ') else {
+            return false;
+        };
+        if !scheme.eq_ignore_ascii_case("basic") {
+            return false;
+        }
+        let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64.trim()) else {
+            return false;
+        };
+        let Some(pos) = raw.iter().position(|&b| b == b':') else {
+            return false;
+        };
+        let (u, p) = (&raw[..pos], &raw[pos + 1..]);
+        return crate::client::constant_time_eq(u, user.as_bytes())
+            && crate::client::constant_time_eq(p, pass.as_bytes());
+    }
+    false
+}
+
 fn parse_host_port(s: &str, default_port: u16) -> Result<(String, u16)> {
     let s = s.trim();
     anyhow::ensure!(!s.is_empty(), "empty target");
@@ -194,5 +247,30 @@ mod tests {
             parse_host_port("[2001:db8::1]", 443).unwrap(),
             ("2001:db8::1".into(), 443)
         );
+    }
+
+    #[test]
+    fn proxy_auth_header() {
+        use base64::Engine as _;
+        let creds = base64::engine::general_purpose::STANDARD.encode("alice:secret");
+        let head =
+            format!("CONNECT x:443 HTTP/1.1\r\nProxy-Authorization: Basic {creds}\r\nHost: x\r\n");
+        assert!(proxy_auth_ok(&head, "alice", "secret"));
+        assert!(!proxy_auth_ok(&head, "alice", "wrong"));
+        // header name and scheme are case-insensitive
+        let head2 = format!("CONNECT x:443 HTTP/1.1\r\nproxy-authorization: BASIC {creds}\r\n");
+        assert!(proxy_auth_ok(&head2, "alice", "secret"));
+        // missing header
+        assert!(!proxy_auth_ok(
+            "CONNECT x:443 HTTP/1.1\r\nHost: x\r\n",
+            "alice",
+            "secret"
+        ));
+        // malformed base64
+        assert!(!proxy_auth_ok(
+            "CONNECT x:443 HTTP/1.1\r\nProxy-Authorization: Basic !!!\r\n",
+            "alice",
+            "secret"
+        ));
     }
 }

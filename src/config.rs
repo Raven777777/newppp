@@ -41,6 +41,11 @@ pub struct Cli {
     #[arg(long = "http-bind", value_name = "ADDR")]
     pub http_bind: Option<String>,
 
+    /// [client] require local proxy authentication (SOCKS5 RFC1929 username/
+    /// password and HTTP proxy Basic auth)
+    #[arg(long = "inbound-auth", value_name = "USER:PASS")]
+    pub inbound_auth: Option<String>,
+
     /// [client] number of pooled WebTransport connections (1..8)
     #[arg(long = "conns", value_name = "N", default_value_t = 2)]
     pub conns: usize,
@@ -109,6 +114,7 @@ pub struct ClientConfig {
     pub fb_url: Option<String>,
     pub socks_bind: String,
     pub http_bind: Option<String>,
+    pub inbound_auth: Option<(String, String)>,
     pub conns: usize,
     pub uid: String,
     pub password: String,
@@ -155,6 +161,23 @@ fn parse_auth(raw: &str) -> anyhow::Result<(String, String)> {
     Ok((uid.to_string(), p.to_string()))
 }
 
+/// Parse `--inbound-auth USER:PASS`. RFC1929 length fields are one byte, so
+/// both parts must be 1..=255 bytes and valid UTF-8 (CLI args already are).
+fn parse_inbound_auth(raw: &str) -> anyhow::Result<(String, String)> {
+    let (u, p) = raw
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("--inbound-auth must be USER:PASS, got '{raw}'"))?;
+    anyhow::ensure!(
+        !u.is_empty() && u.len() <= 255,
+        "inbound username must be 1..=255 bytes"
+    );
+    anyhow::ensure!(
+        !p.is_empty() && p.len() <= 255,
+        "inbound password must be 1..=255 bytes"
+    );
+    Ok((u.to_string(), p.to_string()))
+}
+
 impl Cli {
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.client == self.server {
@@ -179,6 +202,10 @@ impl Cli {
             fb_url: self.url.clone(),
             socks_bind: self.bind.clone(),
             http_bind: self.http_bind.clone(),
+            inbound_auth: match &self.inbound_auth {
+                Some(raw) => Some(parse_inbound_auth(raw)?),
+                None => None,
+            },
             conns: self.conns.clamp(1, 8),
             uid,
             password,

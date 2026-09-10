@@ -21,11 +21,10 @@ use bytes::{Buf, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 // Re-exported for downstream modules (mux, server, client).
-pub use super::crypto::{CounterGen, FrameCipher, ReplayWindow};
+pub use super::crypto::{CounterGen, FrameCipher, ReplayWindow, TAG_LEN};
 
 pub const PROTO_VERSION: u8 = 1;
 pub const HEADER_LEN: usize = 20;
-pub const TAG_LEN: usize = 16;
 pub const MAX_PLAINTEXT: usize = 16 * 1024;
 pub const MAX_CIPHERTEXT: usize = MAX_PLAINTEXT + TAG_LEN;
 
@@ -146,14 +145,32 @@ impl FrameEncoder {
         Self { cipher, counters }
     }
 
-    pub fn encode(&self, ftype: FrameType, flags: u16, sid: u32, payload: &[u8]) -> Result<Bytes> {
+    /// Append one encoded frame to `out`. `out` can be reused across frames
+    /// (`clear()` keeps its capacity), avoiding a per-frame allocation.
+    pub fn encode_into(
+        &self,
+        ftype: FrameType,
+        flags: u16,
+        sid: u32,
+        payload: &[u8],
+        out: &mut BytesMut,
+    ) -> Result<()> {
         ensure!(payload.len() <= MAX_PLAINTEXT, "frame payload too large");
         let counter = self.counters.next();
         let header = build_header(ftype, flags, sid, payload.len() + TAG_LEN, counter);
-        let ct = self.cipher.seal(counter, &header[..12], payload)?;
-        let mut out = BytesMut::with_capacity(HEADER_LEN + ct.len());
         out.extend_from_slice(&header);
-        out.extend_from_slice(&ct);
+        let start = out.len();
+        out.extend_from_slice(payload);
+        let tag = self
+            .cipher
+            .seal_slice(counter, &header[..12], &mut out[start..])?;
+        out.extend_from_slice(&tag);
+        Ok(())
+    }
+
+    pub fn encode(&self, ftype: FrameType, flags: u16, sid: u32, payload: &[u8]) -> Result<Bytes> {
+        let mut out = BytesMut::with_capacity(HEADER_LEN + payload.len() + TAG_LEN);
+        self.encode_into(ftype, flags, sid, payload, &mut out)?;
         Ok(out.freeze())
     }
 }
@@ -200,7 +217,8 @@ impl FrameDecoder {
         if self.buf.len() < HEADER_LEN {
             return Ok(None);
         }
-        let header: [u8; HEADER_LEN] = self.buf[..HEADER_LEN].try_into().unwrap();
+        let mut header = [0u8; HEADER_LEN];
+        header.copy_from_slice(&self.buf[..HEADER_LEN]);
         let info = parse_header(&header)?;
         ensure!(
             info.ct_len >= TAG_LEN && info.ct_len <= MAX_CIPHERTEXT,
@@ -273,10 +291,12 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
     }
 }
 
-/// Push-encoder over any `AsyncWrite`.
+/// Push-encoder over any `AsyncWrite`. Keeps a reusable encode buffer so a
+/// steady write loop performs no per-frame allocation.
 pub struct FrameWriter<W> {
     w: W,
     enc: FrameEncoder,
+    buf: BytesMut,
 }
 
 impl<W: AsyncWrite + Unpin> FrameWriter<W> {
@@ -284,6 +304,7 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
         Self {
             w,
             enc: FrameEncoder::new(cipher, counters),
+            buf: BytesMut::new(),
         }
     }
 
@@ -298,8 +319,10 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
         sid: u32,
         payload: &[u8],
     ) -> Result<()> {
-        let bytes = self.enc.encode(ftype, flags, sid, payload)?;
-        self.w.write_all(&bytes).await?;
+        self.buf.clear(); // keeps capacity
+        self.enc
+            .encode_into(ftype, flags, sid, payload, &mut self.buf)?;
+        self.w.write_all(&self.buf).await?;
         Ok(())
     }
 
@@ -416,5 +439,72 @@ mod tests {
         let (h, po) = decode_open(&p).unwrap();
         assert_eq!(h, "example.com");
         assert_eq!(po, 443);
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Arbitrary chunked input must never panic; on a decode error the
+        /// decoder is cleared and remains usable.
+        #[test]
+        fn decoder_never_panics_on_arbitrary_input(
+            chunks in proptest::collection::vec(
+                proptest::collection::vec(any::<u8>(), 0..64),
+                0..32,
+            )
+        ) {
+            let cipher = Arc::new(FrameCipher::new(&[0x5a; 32]));
+            let mut dec = FrameDecoder::new(Some(cipher), None);
+            for c in chunks {
+                dec.feed(&c);
+                loop {
+                    match dec.next_frame() {
+                        Ok(Some(_)) => {}
+                        Ok(None) => break,
+                        Err(_) => {
+                            dec.clear();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        /// After arbitrary garbage and a `clear()`, a well-formed frame must
+        /// still decode (state is recoverable, buffer is not poisoned).
+        #[test]
+        fn decoder_recovers_after_clear(
+            garbage in proptest::collection::vec(any::<u8>(), 0..256),
+            payload in proptest::collection::vec(any::<u8>(), 0..4096),
+        ) {
+            let cipher = Arc::new(FrameCipher::new(&[0x33; 32]));
+            let enc = FrameEncoder::new(cipher.clone(), CounterGen::stream());
+            let wire = enc.encode(FrameType::Data, 0, 5, &payload).unwrap();
+
+            let mut dec = FrameDecoder::new(Some(cipher), None);
+            dec.feed(&garbage);
+            while let Ok(Some(_)) = dec.next_frame() {}
+            dec.clear();
+            dec.feed(&wire);
+            let f = dec.next_frame().expect("no error").expect("frame");
+            prop_assert_eq!(f.payload, payload);
+        }
+
+        #[test]
+        fn open_encode_decode_roundtrip(host in "[a-z0-9.]{1,50}", port in any::<u16>()) {
+            let p = encode_open(&host, port);
+            let (h, po) = decode_open(&p).unwrap();
+            prop_assert_eq!(h, host);
+            prop_assert_eq!(po, port);
+        }
+
+        #[test]
+        fn decode_open_never_panics(b in proptest::collection::vec(any::<u8>(), 0..300)) {
+            let _ = decode_open(&b);
+        }
     }
 }

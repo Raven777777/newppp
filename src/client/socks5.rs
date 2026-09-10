@@ -14,22 +14,27 @@ use crate::proto::addr::{build_socks5_udp, parse_socks5_udp};
 
 const UDP_IDLE: Duration = Duration::from_secs(300);
 
-pub async fn run(bind: String, ob: Outbound) -> Result<()> {
+pub async fn run(bind: String, ob: Outbound, auth: Option<(String, String)>) -> Result<()> {
     let listener = TcpListener::bind(&bind).await?;
-    info!("SOCKS5 listening on {bind}");
+    if auth.is_some() {
+        info!("SOCKS5 listening on {bind} (username/password required)");
+    } else {
+        info!("SOCKS5 listening on {bind}");
+    }
     loop {
         let (sock, peer) = listener.accept().await?;
         let ob = ob.clone();
+        let auth = auth.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(sock, ob).await {
+            if let Err(e) = handle(sock, ob, auth).await {
                 debug!("socks5 conn from {peer} ended: {e:#}");
             }
         });
     }
 }
 
-async fn handle(mut sock: TcpStream, ob: Outbound) -> Result<()> {
-    // ---- greeting ----
+async fn handle(mut sock: TcpStream, ob: Outbound, auth: Option<(String, String)>) -> Result<()> {
+    // ---- greeting / method selection ----
     let mut h = [0u8; 2];
     sock.read_exact(&mut h).await?;
     if h[0] != 5 {
@@ -37,7 +42,32 @@ async fn handle(mut sock: TcpStream, ob: Outbound) -> Result<()> {
     }
     let mut methods = vec![0u8; h[1] as usize];
     sock.read_exact(&mut methods).await?;
-    sock.write_all(&[5, 0]).await?; // no auth
+
+    match &auth {
+        Some((user, pass)) => {
+            // RFC1929 username/password sub-negotiation.
+            if !methods.contains(&0x02) {
+                sock.write_all(&[5, 0xff]).await?;
+                anyhow::bail!("client offered no username/password auth method");
+            }
+            sock.write_all(&[5, 0x02]).await?;
+            let (u, p) = read_rfc1929(&mut sock).await?;
+            let ok = crate::client::constant_time_eq(u.as_bytes(), user.as_bytes())
+                && crate::client::constant_time_eq(p.as_bytes(), pass.as_bytes());
+            sock.write_all(&[1, if ok { 0 } else { 1 }]).await?;
+            if !ok {
+                anyhow::bail!("socks5 authentication failed");
+            }
+        }
+        None => {
+            if methods.contains(&0) {
+                sock.write_all(&[5, 0]).await?; // no auth
+            } else {
+                sock.write_all(&[5, 0xff]).await?;
+                anyhow::bail!("client requires an unsupported auth method");
+            }
+        }
+    }
 
     // ---- request ----
     let mut head = [0u8; 3];
@@ -84,6 +114,25 @@ async fn read_target(sock: &mut TcpStream) -> Result<(String, u16)> {
     let mut p = [0u8; 2];
     sock.read_exact(&mut p).await?;
     Ok((host, u16::from_be_bytes(p)))
+}
+
+/// RFC1929 sub-negotiation: VER(1) ULEN UNAME PLEN PASSWD.
+async fn read_rfc1929(sock: &mut TcpStream) -> Result<(String, String)> {
+    let mut ver = [0u8; 1];
+    sock.read_exact(&mut ver).await?;
+    anyhow::ensure!(ver[0] == 1, "bad RFC1929 version {}", ver[0]);
+    let mut ulen = [0u8; 1];
+    sock.read_exact(&mut ulen).await?;
+    let mut u = vec![0u8; ulen[0] as usize];
+    sock.read_exact(&mut u).await?;
+    let mut plen = [0u8; 1];
+    sock.read_exact(&mut plen).await?;
+    let mut p = vec![0u8; plen[0] as usize];
+    sock.read_exact(&mut p).await?;
+    Ok((
+        String::from_utf8(u).map_err(|_| anyhow!("bad username encoding"))?,
+        String::from_utf8(p).map_err(|_| anyhow!("bad password encoding"))?,
+    ))
 }
 
 async fn reply(sock: &mut TcpStream, code: u8) -> Result<()> {

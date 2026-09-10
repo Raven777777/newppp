@@ -101,12 +101,17 @@ newppp -c --auth alice:secret123 \
 * `--server` 与 `--url` 至少配一个；两者都配时 WT 优先、失败自动降级（连续传输层故障会熔断主路径一段时间，见「架构→降级链」）。
 * **形态 B（纯网站形态）**：去掉 `--server` 只留 `--url`，并使用省略 `--listen` 的服务端（见上）；套 Cloudflare 时 `--url` 换成 `wss://`（见形态 B-CF）。
 * 自签调试加 `--skip-verify`；换成 Let's Encrypt 证书后**去掉**该参数（走系统根证书校验）。
+* 绑 `0.0.0.0`（NAS/局域网共享）时建议加 `--inbound-auth user:pass`：SOCKS5 走 RFC1929 用户名/密码、HTTP 代理走 Basic Auth，凭证用常量时间比较；不配则本地入站无认证。
 
 ### 验证
 
 ```bash
 curl --socks5-hostname 127.0.0.1:1080 https://www.google.com
 curl -x http://127.0.0.1:8081 https://www.google.com
+
+# 启用 --inbound-auth user:pass 后：
+curl --socks5-hostname user:pass@127.0.0.1:1080 https://www.google.com
+curl -x http://user:pass@127.0.0.1:8081 https://www.google.com
 ```
 
 ## Docker 打包（build_docker.py）
@@ -307,6 +312,7 @@ newppp -c --auth alice:secret123 \
 | `--url` | - | 模式 A 降级 URL，scheme 决定承载：`https://`（双工 POST，直连用）或 `wss://`（WebSocket，套 Cloudflare 必用）；与 `--server` 至少配一个 |
 | `--bind` | 127.0.0.1:1080 | SOCKS5 监听（CONNECT / UDP ASSOCIATE） |
 | `--http-bind` | - | HTTP 代理监听（CONNECT + 简单转发，出口失败回 502） |
+| `--inbound-auth` | - | 本地入站认证 `user:pass`：SOCKS5 RFC1929 用户名/密码 + HTTP 代理 Basic Auth；不配则无需认证（绑 `0.0.0.0` 时建议启用） |
 | `--conns` | 2 | 连接池大小（1..8） |
 | `--recv-window` | 2 | QUIC 每流接收窗口 MB（1..=64，下载方向）：优质高延迟线路可调大提速，高丢包调小抗 `too many gaps` |
 | `--skip-verify` | off | 跳过证书校验（仅调试） |
@@ -408,7 +414,7 @@ newppp -c --auth alice:secret123 \
 * **套 Cloudflare 时不要配 `--server`（WT 主路径）**：CF 边缘接受 h3 但不支持 WebTransport，会重置 WT 会话流——旧版 wtransport(0.6) 会因此 panic（0.7.2 已修复，重置被正常归类为连接错误并自动回落）；CF 后请用 `--url wss://`（见档位 2）。
 * `--listen` 提供时仅端口生效（wtransport 绑定 API 限制），总是绑定全部接口；需要限定地址时用防火墙/iptables 收敛，或省略 `--listen` 完全不监听 UDP。
 * 服务端对未认证连接数无显式上限（依赖 QUIC/TLS 层自身的限流）。
-* quinn 的 QUIC/TLS 指纹与 Chrome 不同；主动 QUIC 指纹探测可区分（被动分类无特征）。
+* quinn 的 QUIC/TLS 指纹与 Chrome 不同；主动 QUIC 指纹探测可区分（被动分类无特征）。缓解方向见 TODO.md「QUIC/TLS 指纹混淆」（拟合 Chrome 传输参数与 ClientHello）。
 * `too many gaps in stream buffer`：quinn 对流重组缓冲乱序空洞数的内部保护，丢包/乱序严重的弱网 UDP 链路 + 大接收窗口下会触发，触发后该连接中止、会话自动回落 HTTPS POST。接收窗口默认 2MB（300ms RTT 单流 ≈ 53Mbps），可用 `--recv-window` 调节（1..=64 MB）：高丢包调小（如 1）、优质高延迟线路调大提速。
 * **WT 主路径熔断**：连续 3 次传输层故障（连接被杀、握手失败等）后熔断 60s，期间新会话直接走兜底不再试错；到期放行一次探测，成功恢复、失败立即再熔断。目标侧拒绝（拨号失败/限额）不计入——那是传输健康、目标不可达。
 * UDP 443 不应答普通 h3 GET（也不发 Alt-Svc）：浏览器不会来（无 Alt-Svc），但定制探测工具可发现"这个 QUIC 服务不是网页"；WT 握手探测则得到 404，与"不支持 WT 的普通源"一致。根治需换 quinn+h3 栈实现 GET/WT 同端口共宿——留作后续演进（TODO.md「暂缓项」）。
@@ -422,16 +428,30 @@ newppp -c --auth alice:secret123 \
 cargo build --release                              # 产物 target/release/newppp
 cargo fmt --all -- --check                         # 格式检查
 cargo clippy --all-targets -- -D warnings          # 静态检查（0 警告基线）
-cargo test                                         # 单元测试（34 项，含回归测试）
+cargo test                                         # 单元测试 + property 测试（47 项，含回归）
+cargo bench --bench frame                          # 帧热路径 criterion 基准
 ```
 
-代码基线：无 `unsafe`、无 `#[allow]` 压制、无未用依赖；edition 2021，开发工具链 Rust 1.97（未声明 MSRV，建议用最新 stable 构建）。
+代码基线：无 `unsafe`、无 `#[allow]` 压制、无未用依赖；TLS/加密统一走 `ring`（已移除 `aws-lc-rs`，构建无需 cmake/nasm）；edition 2021，开发工具链 Rust 1.97（未声明 MSRV，建议用最新 stable 构建）。
+
+## 性能（帧热路径）
+
+每帧的加密与封装是代理吞吐的核心。`benches/frame.rs`（criterion）对 64B / 1KB / 16KB 负载分别测量裸 AEAD 与整帧编解码；生产路径已改为**单次分配 + `encrypt_in_place`**（`FrameCipher::seal_slice`、`FrameEncoder::encode_into`，`FrameWriter` 复用 `BytesMut`）：
+
+| 场景（16KB 帧） | 优化前 | 优化后 |
+|---|---|---|
+| `frame/encode` | 17.34 µs | **13.31 µs（−23%）** |
+| `frame/decode` | 15.86 µs | **13.47 µs（−15%）** |
+| 裸 `aead/seal`（对照） | 14.63 µs | 13.26 µs |
+
+整帧 encode 已与裸 AEAD 持平，说明封装/分配开销基本消除。1Gbps（≈7600 帧/s @16KB）下该路径约 10% 单核占用。
 
 ## 目录结构
 
 ```
 src/
-├── main.rs            # 入口：-c/-s 分发
+├── main.rs            # 入口：-c/-s 分发（薄封装，调用 lib）
+├── lib.rs             # 库入口（供 bench/集成测试复用）
 ├── config.rs          # CLI 与运行时配置
 ├── quic_tune.rs       # 共享 QUIC 传输调优（可调窗口 + BBR 拥塞控制）
 ├── proto/             # 共享协议层
@@ -453,4 +473,6 @@ src/
     ├── state.rs       #   全局与连接状态、会话表、空闲回收（配额恰好一次释放）
     ├── limit.rs       #   令牌桶限速
     └── disguise.rs    #   内嵌伪装页（nginx 欢迎页风格）
+benches/
+└── frame.rs           # 帧热路径 criterion 基准（AEAD / encode / decode）
 ```

@@ -1,12 +1,7 @@
-mod client;
-mod config;
-mod proto;
-mod quic_tune;
-mod server;
-
 use anyhow::Result;
 use clap::Parser;
-use config::Cli;
+
+use newppp::config::Cli;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -27,10 +22,10 @@ fn main() -> Result<()> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         if cli.server {
             let cfg = cli.server_config()?;
-            server::run(cfg).await
+            newppp::server::run(cfg).await
         } else {
             let cfg = cli.client_config()?;
-            client::run(cfg).await
+            newppp::client::run(cfg).await
         }
     })
 }
