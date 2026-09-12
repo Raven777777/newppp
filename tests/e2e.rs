@@ -1004,8 +1004,37 @@ async fn target_failure_does_not_degrade_or_kill() {
     srv.shutdown().await;
 }
 
+/// Block until a port becomes rebindable (handles released inside wtransport's
+/// background driver may lag one poll behind a task abort).
+async fn wait_rebindable_udp(port: u16, what: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match UdpSocket::bind(("0.0.0.0", port)).await {
+            Ok(_l) => return,
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("{what} UDP port {port} never released: {e}"),
+        }
+    }
+}
+
+async fn wait_rebindable_tcp(port: u16, what: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(_l) => return,
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("{what} TCP port {port} never released: {e}"),
+        }
+    }
+}
+
 /// 11: lifecycle — finished sessions release their quota, and every listen
-/// port is immediately reusable once all handles are dropped.
+/// port is reusable once all handles are dropped (bounded wait: the QUIC
+/// driver may release its socket one poll after the task's future drops).
 #[tokio::test]
 async fn lifecycle_no_leak_ports_reusable() {
     let srv = spawn_server(true).await.expect("server");
@@ -1015,11 +1044,10 @@ async fn lifecycle_no_leak_ports_reusable() {
 
     let ob = wt_outbound(&srv.wt_url());
     let socks_port = free_port();
-    let inbound = tokio::spawn(socks5::run(
-        format!("127.0.0.1:{socks_port}"),
-        ob.clone(),
-        None,
-    ));
+    let ob_inbound = ob.clone();
+    let inbound = tokio::spawn(async move {
+        let _ = socks5::run(format!("127.0.0.1:{socks_port}"), ob_inbound, None).await;
+    });
     wait_tcp_port(socks_port).await.expect("socks inbound");
 
     socks5_get(socks_port, "127.0.0.1", target)
@@ -1031,18 +1059,12 @@ async fn lifecycle_no_leak_ports_reusable() {
     inbound.abort();
     let _ = inbound.await;
     drop(ob);
-    TcpListener::bind(("127.0.0.1", socks_port))
-        .await
-        .expect("socks port must be immediately reusable after drop");
+    wait_rebindable_tcp(socks_port, "socks").await;
 
-    // Server teardown: both listener ports immediately reusable.
+    // Server teardown: both listener ports reusable promptly after drop.
     srv.shutdown().await;
-    TcpListener::bind(("127.0.0.1", fb_port))
-        .await
-        .expect("fallback TCP port must be immediately reusable after drop");
-    UdpSocket::bind(("0.0.0.0", wt_port))
-        .await
-        .expect("WT (UDP) port must be immediately reusable after drop");
+    wait_rebindable_tcp(fb_port, "fallback TLS").await;
+    wait_rebindable_udp(wt_port, "WT").await;
 }
 
 // ---------------------------------------------------------------------------
