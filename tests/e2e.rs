@@ -83,6 +83,23 @@ struct TestServer {
 
 impl TestServer {
     async fn shutdown(mut self) {
+        // Close live QUIC connections BEFORE aborting the listeners: the
+        // per-connection tasks spawned by run_wt hold Connection clones and
+        // keep running across an accept-loop abort, so the QUIC endpoint
+        // driver (and its bound UDP socket) would linger until every
+        // connection closed on its own. Active close → quick drain → the
+        // driver releases the socket.
+        let conns: Vec<_> = self
+            .state
+            .conns
+            .iter()
+            .filter(|c| !c.value().cancel.is_cancelled())
+            .map(|c| c.value().cancel.clone())
+            .collect();
+        for t in conns {
+            t.cancel();
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
         for t in self.tasks.drain(..) {
             t.abort();
             let _ = t.await;
