@@ -73,7 +73,9 @@ impl UdpAddr {
             2 => {
                 let b = r.read_bytes(16)?;
                 let port = read_port(r)?;
-                let ip = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(b).expect("16 bytes"));
+                let mut oct = [0u8; 16];
+                oct.copy_from_slice(b);
+                let ip = std::net::Ipv6Addr::from(oct);
                 Ok(UdpAddr::V6(SocketAddrV6::new(ip, port, 0, 0)))
             }
             3 => {
@@ -132,7 +134,8 @@ impl<'a> Reader<'a> {
     }
 
     pub fn read_bytes(&mut self, n: usize) -> Result<&'a [u8]> {
-        ensure!(self.pos + n <= self.b.len(), "read past end");
+        // `len - pos` instead of `pos + n`: no overflow even for huge `n`
+        ensure!(self.b.len() - self.pos >= n, "read past end");
         let s = &self.b[self.pos..self.pos + n];
         self.pos += n;
         Ok(s)

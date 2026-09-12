@@ -25,6 +25,7 @@ import os
 import re
 import shlex
 import tarfile
+import time
 import urllib.request
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -35,6 +36,8 @@ CA_URL = "https://curl.se/ca/cacert.pem"
 CA_PATH_IN_IMAGE = "etc/ssl/certs/ca-certificates.crt"
 # 本地 CA bundle 缓存（避免每次打包都联网；删除该文件即可强制重新下载）
 CA_CACHE = os.path.join(ROOT, ".cacert.pem")
+# 缓存超过该天数即提醒更新（Mozilla 大约每季度更新一次根证书）
+CA_MAX_AGE_DAYS = 90
 
 
 def sha256(data: bytes) -> str:
@@ -49,6 +52,12 @@ def load_ca_bundle() -> bytes:
         if b"BEGIN CERTIFICATE" in data:
             print(f"CA 根证书: 使用本地缓存 {CA_CACHE} "
                   f"({data.count(b'BEGIN CERTIFICATE')} 个)")
+            age_days = (time.time() - os.path.getmtime(CA_CACHE)) / 86400.0
+            if age_days > CA_MAX_AGE_DAYS:
+                print(f"  ⚠ 警告: 缓存已 {age_days:.0f} 天未更新 "
+                      f"(阈值 {CA_MAX_AGE_DAYS} 天)。Mozilla 每季度更新根证书，"
+                      f"新签发证书可能因链路过期而校验失败；"
+                      f"删除 {CA_CACHE} 后重新打包即可刷新。")
             return data
     print(f"CA 根证书: 从 {CA_URL} 下载 ...")
     with urllib.request.urlopen(CA_URL, timeout=30) as resp:

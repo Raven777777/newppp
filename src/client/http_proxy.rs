@@ -7,16 +7,22 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing::{debug, info};
 
-use crate::client::outbound::Outbound;
+use crate::client::outbound::{error_tag, Outbound};
 
 const MAX_HEAD: usize = 16 * 1024;
 
-/// Minimal error response so clients see a clean failure instead of a
-/// connection reset when the outbound cannot be established.
-async fn reply_error(sock: &mut tokio::net::TcpStream) {
-    let _ = sock
-        .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-        .await;
+/// Error response so clients see a clean failure instead of a connection
+/// reset. `tag` is a stable category (dial-failed / session-limit /
+/// private-target-denied / transport-failure) carried in `X-Newppp-Error`
+/// and the body for scripted assertions.
+async fn reply_error(sock: &mut tokio::net::TcpStream, tag: &str) {
+    let body = format!("newppp error: {tag}\n");
+    let resp = format!(
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\n\
+         X-Newppp-Error: {tag}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = sock.write_all(resp.as_bytes()).await;
 }
 
 pub async fn run(bind: String, ob: Outbound, auth: Option<(String, String)>) -> Result<()> {
@@ -62,11 +68,19 @@ async fn handle(
 
     let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
     let mut lines = head.split("\r\n");
-    let request_line = lines.next().unwrap_or_default();
+    let request_line = lines
+        .next()
+        .ok_or_else(|| anyhow!("missing request line"))?;
     let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or_default().to_string();
-    let target = parts.next().unwrap_or_default().to_string();
-    let _version = parts.next().unwrap_or_default();
+    let method = parts.next().ok_or_else(|| anyhow!("missing method"))?;
+    let target = parts.next().ok_or_else(|| anyhow!("missing target"))?;
+    let version = parts
+        .next()
+        .ok_or_else(|| anyhow!("missing HTTP version"))?;
+    anyhow::ensure!(
+        parts.next().is_none() && matches!(version, "HTTP/1.0" | "HTTP/1.1"),
+        "malformed HTTP request line"
+    );
 
     if let Some((user, pass)) = &auth {
         if !proxy_auth_ok(&head, user, pass) {
@@ -82,12 +96,12 @@ async fn handle(
     }
 
     if method.eq_ignore_ascii_case("CONNECT") {
-        let (host, port) = parse_host_port(&target, 443)?;
+        let (host, port) = parse_host_port(target, 443)?;
         let rest = buf.split_off(head_end + 4); // bytes after the head
         let mut remote = match ob.open_tcp(&host, port).await {
             Ok(r) => r,
             Err(e) => {
-                reply_error(&mut sock).await;
+                reply_error(&mut sock, error_tag(&e)).await;
                 return Err(e);
             }
         };
@@ -105,19 +119,49 @@ async fn handle(
         let hostport = target
             .strip_prefix("http://")
             .ok_or_else(|| anyhow!("only http:// and CONNECT supported"))?;
-        let end = hostport.find('/').unwrap_or(hostport.len());
+        let end = hostport.find(['/', '?']).unwrap_or(hostport.len());
         let (host, port) = parse_host_port(&hostport[..end], 80)?;
         let mut remote = match ob.open_tcp(&host, port).await {
             Ok(r) => r,
             Err(e) => {
-                reply_error(&mut sock).await;
+                reply_error(&mut sock, error_tag(&e)).await;
                 return Err(e);
             }
         };
-        remote.write_all(&buf).await?; // forward head (+ any pipelined bytes)
+        let suffix = &hostport[end..];
+        let origin = if suffix.is_empty() {
+            "/".to_string()
+        } else if suffix.starts_with('?') {
+            format!("/{suffix}")
+        } else {
+            suffix.to_string()
+        };
+        let forwarded_head = forward_http_head(&head, method, &origin, version);
+        remote.write_all(forwarded_head.as_bytes()).await?;
+        remote.write_all(&buf[head_end + 4..]).await?;
         tokio::io::copy_bidirectional(&mut sock, &mut remote).await?;
         Ok(())
     }
+}
+
+/// Convert proxy absolute-form to origin-form and do not forward proxy
+/// credentials to the destination server.
+fn forward_http_head(head: &str, method: &str, origin: &str, version: &str) -> String {
+    let mut out = format!("{method} {origin} {version}\r\n");
+    for line in head.split("\r\n").skip(1) {
+        let Some((name, _)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("proxy-authorization")
+            || name.eq_ignore_ascii_case("proxy-connection")
+        {
+            continue;
+        }
+        out.push_str(line);
+        out.push_str("\r\n");
+    }
+    out.push_str("\r\n");
+    out
 }
 
 /// Duplex wrapper: replays buffered bytes before delegating to the inner
@@ -272,5 +316,15 @@ mod tests {
             "alice",
             "secret"
         ));
+    }
+
+    #[test]
+    fn forward_head_strips_proxy_credentials_and_uses_origin_form() {
+        let head = "GET http://example.com/path?q=1 HTTP/1.1\r\nProxy-Authorization: Basic secret\r\nProxy-Connection: keep-alive\r\nHost: example.com\r\n";
+        let out = forward_http_head(head, "GET", "/path?q=1", "HTTP/1.1");
+        assert!(out.starts_with("GET /path?q=1 HTTP/1.1\r\n"));
+        assert!(out.contains("Host: example.com\r\n"));
+        assert!(!out.contains("Proxy-Authorization"));
+        assert!(!out.contains("Proxy-Connection"));
     }
 }

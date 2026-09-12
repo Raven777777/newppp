@@ -24,17 +24,15 @@ use crate::proto::crypto::{self, AuthPayload, AUTH_WINDOW};
 use crate::proto::frame::Frame;
 use state::ServerState;
 
-pub async fn run(cfg: ServerConfig) -> Result<()> {
+/// Build the shared server state. Public so integration tests can wire the
+/// real listeners with an inspectable state.
+pub fn build_state(cfg: &ServerConfig) -> Arc<ServerState> {
     let static_keys: HashMap<String, [u8; 32]> = cfg
         .users
         .iter()
         .map(|(u, p)| (u.clone(), crypto::derive_static_key(p, u)))
         .collect();
-    for u in static_keys.keys() {
-        info!("user '{u}' registered");
-    }
-
-    let st = Arc::new(ServerState {
+    Arc::new(ServerState {
         static_keys,
         conns: DashMap::new(),
         conn_seq: AtomicU64::new(1),
@@ -42,9 +40,22 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         max_sessions: cfg.max_sessions,
         rate_mbps: cfg.rate_mbps,
         idle: Duration::from_secs(cfg.idle_secs),
+        allow_private_targets: cfg.allow_private_targets,
+        unauth: Arc::new(limit::UnauthGate::new(
+            cfg.max_unauth,
+            (cfg.max_unauth / 8).clamp(2, 64),
+        )),
         seen_nonces: DashMap::new(),
+        nonce_lock: std::sync::Mutex::new(()),
         path: cfg.path.clone(),
-    });
+    })
+}
+
+pub async fn run(cfg: ServerConfig) -> Result<()> {
+    let st = build_state(&cfg);
+    for u in st.static_keys.keys() {
+        info!("user '{u}' registered");
+    }
 
     tokio::spawn(reaper_loop(st.clone()));
 
@@ -192,9 +203,21 @@ pub fn bearer_ok(st: &ServerState, header: Option<&str>) -> bool {
     bearer_user(st, header).is_some()
 }
 
-/// Decrypt and verify the in-band AUTH frame (first frame of a channel).
-/// Returns (uid, static_key, payload).
-pub fn auth_from_frame(st: &ServerState, f: &Frame) -> Option<(String, [u8; 32], AuthPayload)> {
+/// Outcome of verifying the in-band AUTH frame (first frame of a channel).
+pub enum AuthOutcome {
+    /// Authenticated: uid, static key and decoded payload.
+    Ok(String, [u8; 32], AuthPayload),
+    /// The payload authenticated under a known key, but advertises an
+    /// incompatible protocol version. This is a configuration error, not an
+    /// attacker — surface it explicitly instead of a generic decrypt failure.
+    VersionMismatch { client: u8, server: u8 },
+    /// Wrong key, malformed payload, expired timestamp or replay.
+    Rejected,
+}
+
+/// Decrypt and verify the in-band AUTH frame. Runs the version check before
+/// the replay cache so a version skew never consumes a nonce.
+pub fn auth_from_frame(st: &ServerState, f: &Frame) -> AuthOutcome {
     for (uid, skey) in st.static_keys.iter() {
         let cipher = crypto::FrameCipher::new(skey);
         let Ok(pt) = cipher.open(f.counter, &f.aad, &f.payload) else {
@@ -203,16 +226,25 @@ pub fn auth_from_frame(st: &ServerState, f: &Frame) -> Option<(String, [u8; 32],
         let Ok(ap) = AuthPayload::decode(&pt) else {
             continue;
         };
-        if ap.uid != *uid || !ap.verify(skey, AUTH_WINDOW) {
+        if ap.uid != *uid {
+            continue;
+        }
+        if !ap.proto_version_compatible() {
+            return AuthOutcome::VersionMismatch {
+                client: ap.proto_version,
+                server: crate::proto::frame::PROTO_VERSION,
+            };
+        }
+        if !ap.verify(skey, AUTH_WINDOW) {
             continue;
         }
         if !st.check_and_remember_nonce(uid, &ap.nonce, ap.ts) {
             warn!("replayed auth nonce from uid={uid}");
-            return None;
+            return AuthOutcome::Rejected;
         }
-        return Some((uid.clone(), *skey, ap));
+        return AuthOutcome::Ok(uid.clone(), *skey, ap);
     }
-    None
+    AuthOutcome::Rejected
 }
 
 #[cfg(test)]
@@ -236,7 +268,10 @@ mod tests {
             max_sessions: 10,
             rate_mbps: 0,
             idle: Duration::from_secs(60),
+            allow_private_targets: false,
+            unauth: Arc::new(limit::UnauthGate::new(128, 16)),
             seen_nonces: DashMap::new(),
+            nonce_lock: std::sync::Mutex::new(()),
             path: "/api/ppp".into(),
         }
     }
@@ -261,6 +296,64 @@ mod tests {
         let h2 = format!("Bearer {}", crypto::make_bearer(&key, "alice"));
         assert!(bearer_user(&st, Some(h1.as_str())).is_some());
         assert!(bearer_user(&st, Some(h2.as_str())).is_some());
+    }
+
+    /// Build the raw `Frame` carried by an AUTH payload sealed with `key`.
+    fn auth_frame(key: &[u8; 32], ap: &AuthPayload) -> Frame {
+        use crate::proto::crypto::CounterGen;
+        use crate::proto::frame::{FrameDecoder, FrameEncoder, FrameType};
+        let enc = FrameEncoder::new(
+            Arc::new(crypto::FrameCipher::new(key)),
+            CounterGen::stream(),
+        );
+        let wire = enc.encode(FrameType::Auth, 0, 0, &ap.encode()).unwrap();
+        let mut dec = FrameDecoder::new(None, None);
+        dec.raw = true;
+        dec.feed(&wire);
+        dec.next_frame().unwrap().unwrap()
+    }
+
+    fn versioned_payload(key: &[u8; 32], version: u8) -> AuthPayload {
+        let nonce = [7u8; 16];
+        let ts = crypto::now_unix();
+        AuthPayload {
+            proto_version: version,
+            salt: [3u8; 16],
+            ts,
+            nonce,
+            uid: "alice".into(),
+            mac: crypto::auth_mac(key, "alice", ts, &nonce),
+        }
+    }
+
+    /// A correctly authenticated peer advertising a different protocol
+    /// version must be reported as a named mismatch, not silently rejected.
+    #[test]
+    fn auth_version_mismatch_is_explicit() {
+        let st = test_state();
+        let key = crypto::derive_static_key("pw", "alice");
+        let ap = versioned_payload(&key, crate::proto::frame::PROTO_VERSION.wrapping_add(1));
+        match auth_from_frame(&st, &auth_frame(&key, &ap)) {
+            AuthOutcome::VersionMismatch { client, server } => {
+                assert_eq!(client, crate::proto::frame::PROTO_VERSION.wrapping_add(1));
+                assert_eq!(server, crate::proto::frame::PROTO_VERSION);
+            }
+            _ => panic!("expected VersionMismatch"),
+        }
+        // A mismatch must not consume the replay nonce.
+        assert_eq!(st.seen_nonces.len(), 0);
+    }
+
+    /// Matching versions authenticate normally.
+    #[test]
+    fn auth_matching_version_succeeds() {
+        let st = test_state();
+        let key = crypto::derive_static_key("pw", "alice");
+        let ap = versioned_payload(&key, crate::proto::frame::PROTO_VERSION);
+        assert!(matches!(
+            auth_from_frame(&st, &auth_frame(&key, &ap)),
+            AuthOutcome::Ok(..)
+        ));
     }
 
     /// The nonce cache must not be polluted by traffic that fails MAC

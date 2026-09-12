@@ -102,6 +102,7 @@ impl HttpOutbound {
         let ts = crate::proto::crypto::now_unix();
         let mac = auth_mac(&self.static_key, &self.uid, ts, &nonce);
         let auth = AuthPayload {
+            proto_version: crate::proto::frame::PROTO_VERSION,
             salt,
             ts,
             nonce,

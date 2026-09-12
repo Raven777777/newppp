@@ -20,17 +20,134 @@ pub const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 pub const READ_BUF: usize = 16 * 1024;
 pub const TCP_ROUTE_CAP: usize = 64;
 
-pub async fn dial_target(host: &str, port: u16) -> std::result::Result<TcpStream, OpenError> {
+pub async fn dial_target(
+    host: &str,
+    port: u16,
+    allow_private_targets: bool,
+) -> std::result::Result<TcpStream, OpenError> {
     if host.is_empty() || host.len() > 255 {
         return Err(OpenError::BadTarget);
     }
-    match timeout(DIAL_TIMEOUT, TcpStream::connect((host, port))).await {
+    let addrs = resolve_target(host, port, allow_private_targets).await?;
+    match timeout(DIAL_TIMEOUT, async {
+        for addr in addrs {
+            if let Ok(s) = TcpStream::connect(addr).await {
+                return Ok(s);
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "all target addresses failed",
+        ))
+    })
+    .await
+    {
         Ok(Ok(s)) => {
             let _ = s.set_nodelay(true);
             Ok(s)
         }
         Ok(Err(_)) => Err(OpenError::DialFailed),
         Err(_) => Err(OpenError::DialFailed),
+    }
+}
+
+async fn resolve_target(
+    host: &str,
+    port: u16,
+    allow_private_targets: bool,
+) -> std::result::Result<Vec<std::net::SocketAddr>, OpenError> {
+    let addrs = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        vec![std::net::SocketAddr::new(ip, port)]
+    } else {
+        tokio::time::timeout(DIAL_TIMEOUT, tokio::net::lookup_host((host, port)))
+            .await
+            .map_err(|_| OpenError::DialFailed)?
+            .map_err(|_| OpenError::DialFailed)?
+            .collect()
+    };
+    let addrs: Vec<_> = addrs
+        .into_iter()
+        .filter(|addr| allow_private_targets || is_public_target(*addr))
+        .collect();
+    if addrs.is_empty() {
+        Err(OpenError::Denied)
+    } else {
+        Ok(addrs)
+    }
+}
+
+async fn resolve_udp_target(
+    dst: &UdpAddr,
+    allow_private_targets: bool,
+) -> std::result::Result<std::net::SocketAddr, OpenError> {
+    match dst {
+        UdpAddr::V4(addr) => {
+            let addr = std::net::SocketAddr::V4(*addr);
+            if allow_private_targets || is_public_target(addr) {
+                Ok(addr)
+            } else {
+                Err(OpenError::Denied)
+            }
+        }
+        UdpAddr::V6(addr) => {
+            let addr = std::net::SocketAddr::V6(*addr);
+            if allow_private_targets || is_public_target(addr) {
+                Ok(addr)
+            } else {
+                Err(OpenError::Denied)
+            }
+        }
+        UdpAddr::Domain(host, port) => resolve_target(host, *port, allow_private_targets)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or(OpenError::Denied),
+    }
+}
+
+/// Return whether an address is safe for the default server egress policy.
+/// This intentionally rejects all non-public ranges instead of maintaining a
+/// short blocklist that could miss a special-purpose network.
+pub fn is_public_target(addr: std::net::SocketAddr) -> bool {
+    match addr.ip() {
+        std::net::IpAddr::V4(ip) => {
+            !ip.is_unspecified()
+                && !ip.is_loopback()
+                && !ip.is_private()
+                && !ip.is_link_local()
+                && !ip.is_multicast()
+                && !ip.is_broadcast()
+                && {
+                    let o = ip.octets();
+                    !(o[0] == 100 && (64..=127).contains(&o[1]))
+                        && !(o[0] == 192 && o[1] == 0 && o[2] == 0)
+                        && !(o[0] == 192 && o[1] == 0 && o[2] == 2)
+                        && !(o[0] == 198 && o[1] == 18)
+                        && !(o[0] == 198 && o[1] == 19)
+                        && !(o[0] == 198 && o[1] == 51 && o[2] == 100)
+                        && !(o[0] == 203 && o[1] == 0 && o[2] == 113)
+                }
+        }
+        std::net::IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            if segments[..5] == [0, 0, 0, 0, 0] && segments[5] == 0xffff {
+                let v4 = std::net::Ipv4Addr::new(
+                    (segments[6] >> 8) as u8,
+                    segments[6] as u8,
+                    (segments[7] >> 8) as u8,
+                    segments[7] as u8,
+                );
+                return is_public_target(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                    v4,
+                    addr.port(),
+                )));
+            }
+            !ip.is_unspecified()
+                && !ip.is_loopback()
+                && !ip.is_multicast()
+                && !(segments[0] & 0xfe00 == 0xfc00)
+                && !(segments[0] & 0xffc0 == 0xfe80)
+        }
     }
 }
 
@@ -56,7 +173,13 @@ impl Hooks {
         if !self.st.try_acquire_session() {
             return Err(OpenError::Limit);
         }
-        Ok(self.conn.register(sid))
+        let token = self.conn.cancel.child_token();
+        if self.conn.try_register_with(sid, token.clone()).is_none() {
+            // Lost a race against a concurrent registration for the same sid.
+            self.st.release_session();
+            return Err(OpenError::Denied);
+        }
+        Ok(token)
     }
 }
 
@@ -65,6 +188,7 @@ impl ServerHooks for Hooks {
         let st = self.st.clone();
         let conn = self.conn.clone();
         let sink = self.sink.clone();
+        let allow_private_targets = st.allow_private_targets;
         Box::pin(async move {
             // `admit` acquires the global quota only right before registering;
             // on its error paths nothing was acquired, so nothing is released.
@@ -74,7 +198,7 @@ impl ServerHooks for Hooks {
                 sink: sink.clone(),
             }
             .admit(sid)?;
-            let sock = match dial_target(&host, port).await {
+            let sock = match dial_target(&host, port, allow_private_targets).await {
                 Ok(s) => s,
                 Err(e) => {
                     if conn.drop_session(sid) {
@@ -126,7 +250,10 @@ impl ServerHooks for Hooks {
         let st = self.st.clone();
         let conn = self.conn.clone();
         Box::pin(async move {
-            if conn.udp_routes.contains_key(&sid) {
+            // One namespace for TCP and UDP sids: a UDP associate must not
+            // overwrite an existing TCP (or UDP) session handle — that would
+            // orphan the old cancellation token and leak its global quota.
+            if conn.sessions.contains_key(&sid) || conn.udp_routes.contains_key(&sid) {
                 return Err(OpenError::Denied);
             }
             if conn.session_count() >= conn.max_per_conn {
@@ -136,7 +263,10 @@ impl ServerHooks for Hooks {
                 return Err(OpenError::Limit);
             }
             let token = conn.cancel.child_token();
-            conn.register_with(sid, token.clone());
+            if conn.try_register_with(sid, token.clone()).is_none() {
+                st.release_session();
+                return Err(OpenError::Denied);
+            }
             let relay = Arc::new(UdpRelay::new());
             let relay2 = relay.clone();
             let conn2 = conn.clone();
@@ -158,6 +288,7 @@ impl ServerHooks for Hooks {
     fn udp_feed(&self, sid: u32, dst: UdpAddr, data: Vec<u8>) -> crate::proto::mux::BoxFutUnit {
         let conn = self.conn.clone();
         let sink = self.sink.clone();
+        let allow_private_targets = self.st.allow_private_targets;
         Box::pin(async move {
             let relay = conn.udp_routes.get(&sid).map(|r| r.clone());
             let Some(relay) = relay else {
@@ -165,7 +296,7 @@ impl ServerHooks for Hooks {
                 return;
             };
             conn.touch(sid);
-            let Ok(addr) = dst.resolve().await else {
+            let Ok(addr) = resolve_udp_target(&dst, allow_private_targets).await else {
                 debug!("udp_feed: resolve failed sid={sid}");
                 return;
             };
@@ -361,10 +492,17 @@ pub async fn handle_wt_stream(
         return;
     }
     // Register immediately after acquiring the quota: the dial below can
-    // block up to DIAL_TIMEOUT, and a second stream reusing this sid must be
-    // rejected meanwhile (otherwise both register and one quota leaks).
+    // block up to DIAL_TIMEOUT, and a concurrent stream reusing this sid must
+    // be rejected meanwhile (otherwise both register and one quota leaks).
+    // `try_register_with` is atomic, so two racing streams cannot both win.
     let token = conn.cancel.child_token();
-    conn.register_with(sid, token.clone());
+    if conn.try_register_with(sid, token.clone()).is_none() {
+        let _ = writer
+            .write(FrameType::OpenErr, 0, sid, &[OpenError::Denied.to_code()])
+            .await;
+        st.release_session();
+        return;
+    }
     let (host, port) = match decode_open(&first.payload) {
         Ok(v) => v,
         Err(_) => {
@@ -382,7 +520,7 @@ pub async fn handle_wt_stream(
             return;
         }
     };
-    let sock = match dial_target(&host, port).await {
+    let sock = match dial_target(&host, port, st.allow_private_targets).await {
         Ok(s) => s,
         Err(e) => {
             let _ = writer
@@ -513,14 +651,17 @@ mod tests {
             max_sessions: 10,
             rate_mbps: 0,
             idle: Duration::from_secs(60),
+            allow_private_targets: false,
+            unauth: Arc::new(crate::server::limit::UnauthGate::new(128, 16)),
             seen_nonces: dashmap::DashMap::new(),
+            nonce_lock: std::sync::Mutex::new(()),
             path: "/api/ppp".into(),
         });
         let conn = Arc::new(ConnState {
             id: 1,
             uid: "u".into(),
             cipher: Arc::new(FrameCipher::new(&[0u8; 32])),
-            stream_counters: crate::proto::crypto::CounterGen::stream(),
+            stream_counters: crate::proto::crypto::CounterGen::stream_server(),
             rate: RateLimiter::new(0),
             cancel: CancellationToken::new(),
             sessions: Default::default(),
@@ -573,5 +714,48 @@ mod tests {
             Err(OpenError::Denied)
         );
         assert_eq!(st.active_sessions.load(Ordering::Relaxed), 1);
+    }
+
+    /// A UDP associate reusing an existing TCP session's sid must be denied
+    /// without touching the quota or clobbering the TCP handle.
+    #[tokio::test]
+    async fn udp_associate_rejects_tcp_sid_collision() {
+        let (st, conn) = setup();
+        let hooks = Hooks {
+            st: st.clone(),
+            conn: conn.clone(),
+            sink: FrameSink::Chan(tokio::sync::mpsc::channel(1).0),
+        };
+        assert!(st.try_acquire_session());
+        conn.register(4);
+        assert_eq!(st.active_sessions.load(Ordering::Relaxed), 1);
+
+        let res = hooks
+            .udp_associate(4, FrameSink::Chan(tokio::sync::mpsc::channel(1).0))
+            .await;
+        assert_eq!(res, Err(OpenError::Denied));
+        assert_eq!(st.active_sessions.load(Ordering::Relaxed), 1);
+        assert!(conn.sessions.contains_key(&4));
+        assert!(conn.udp_routes.get(&4).is_none());
+    }
+
+    #[test]
+    fn public_target_policy_rejects_special_ranges() {
+        assert!(is_public_target("8.8.8.8:53".parse().unwrap()));
+        for target in [
+            "127.0.0.1:80",
+            "10.0.0.1:80",
+            "172.16.0.1:80",
+            "192.168.1.1:80",
+            "169.254.169.254:80",
+            "100.64.0.1:80",
+            "192.0.2.1:80",
+            "[::1]:80",
+            "[fc00::1]:80",
+            "[fe80::1]:80",
+            "[::ffff:127.0.0.1]:80",
+        ] {
+            assert!(!is_public_target(target.parse().unwrap()), "{target}");
+        }
     }
 }

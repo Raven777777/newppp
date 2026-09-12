@@ -41,6 +41,23 @@ pub fn target_error(e: &anyhow::Error) -> Option<TargetError> {
     e.downcast_ref::<TargetError>().copied()
 }
 
+/// Stable category token for a session-open failure, used by the local proxy
+/// inbounds (SOCKS5 reply code / HTTP `X-Newppp-Error`) and e2e assertions.
+/// Non-target (transport) failures are reported as `transport-failure`.
+pub fn error_tag(e: &anyhow::Error) -> &'static str {
+    target_error(e).map_or("transport-failure", |t| t.0.tag())
+}
+
+/// RFC1928 reply code for a session-open failure. Distinct codes let the
+/// caller tell "blocked by policy" (0x02) from "target refused" (0x05).
+pub fn socks5_reply_code(e: &anyhow::Error) -> u8 {
+    match target_error(e) {
+        Some(TargetError(OpenError::Denied)) => 0x02,
+        Some(TargetError(OpenError::DialFailed)) => 0x05,
+        _ => 0x01,
+    }
+}
+
 /// How many consecutive transport failures trip the breaker...
 const BREAKER_THRESHOLD: u32 = 3;
 /// ...and how long the primary path stays skipped afterwards.

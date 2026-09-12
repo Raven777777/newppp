@@ -12,7 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use wtransport::endpoint::endpoint_side::Client as WtClientSide;
 use wtransport::endpoint::ConnectOptions;
 use wtransport::{ClientConfig as WtClientConfig, Endpoint};
@@ -57,10 +57,18 @@ pub struct WtConn {
     next_sid: AtomicU32,
     sessions: AtomicUsize,
     alive: AtomicBool,
+    /// Set when a Pong arrives in the current heartbeat window; reset by
+    /// the ping task on each tick.
+    pong_seen: AtomicBool,
+    /// Consecutive heartbeat ticks without a Pong. Reaching
+    /// PONG_MISS_LIMIT marks the link half-dead (TCP may still be up).
+    missed_pings: AtomicUsize,
     udp: DashMap<u32, mpsc::Sender<(UdpAddr, Vec<u8>)>>,
     pending_udp: DashMap<u32, oneshot::Sender<Result<(), OpenError>>>,
     close: CancellationToken,
 }
+
+const PONG_MISS_LIMIT: usize = 2;
 
 impl WtPool {
     pub fn new(cfg: &ClientConfig, url: &str) -> Result<WtPool> {
@@ -258,6 +266,7 @@ impl WtConn {
         let ts = crate::proto::crypto::now_unix();
         let mac = auth_mac(&cfg.static_key, &cfg.uid, ts, &nonce);
         let auth = AuthPayload {
+            proto_version: crate::proto::frame::PROTO_VERSION,
             salt,
             ts,
             nonce,
@@ -299,6 +308,8 @@ impl WtConn {
             next_sid: AtomicU32::new(next_rand_u32()),
             sessions: AtomicUsize::new(0),
             alive: AtomicBool::new(true),
+            pong_seen: AtomicBool::new(false),
+            missed_pings: AtomicUsize::new(0),
             udp: DashMap::new(),
             pending_udp: DashMap::new(),
             close: CancellationToken::new(),
@@ -325,8 +336,7 @@ impl WtConn {
                 while let Ok(Some(f)) = reader.read().await {
                     this2.dispatch(f).await;
                 }
-                this2.alive.store(false, Ordering::Relaxed);
-                this2.close.cancel();
+                this2.expire("control stream closed").await;
             });
         }
 
@@ -353,25 +363,27 @@ impl WtConn {
                         }
                     }
                 }
-                this2.alive.store(false, Ordering::Relaxed);
-                this2.close.cancel();
+                this2.expire("datagram channel closed").await;
             });
         }
 
-        // ---- death watcher + keepalive ----
+        // ---- death watcher + heartbeat (Ping/Pong keepalive) ----
         {
             let this2 = this.clone();
             tokio::spawn(async move {
                 tokio::select! {
-                    _ = this2.conn.closed() => {}
+                    e = this2.conn.closed() => {
+                        let reason = format!("quic closed: {e:?}");
+                        this2.expire(&reason).await;
+                    }
                     _ = this2.close.cancelled() => {
                         // Background tasks hold their own Connection clones;
                         // an explicit close is required for the QUIC
                         // connection (and those tasks) to actually end.
                         this2.conn.close(wtransport::VarInt::from_u32(0), b"pool retired");
+                        this2.expire("connection retired").await;
                     }
                 }
-                this2.alive.store(false, Ordering::Relaxed);
                 this2.close.cancel();
             });
             let this3 = this.clone();
@@ -382,6 +394,25 @@ impl WtConn {
                     tokio::select! {
                         _ = iv.tick() => {}
                         _ = this3.close.cancelled() => break,
+                    }
+                    // Pong liveness judge: each tick marks whether the last
+                    // heartbeat got a reply. PONG_MISS_LIMIT consecutive
+                    // misses (default 2) mean the link is half-dead — the
+                    // TCP session layer may still look fine while the QUIC
+                    // path is unreachable. Retire the conn so the pool
+                    // redials instead of stalling in request timeouts.
+                    if this3.pong_seen.swap(false, Ordering::Relaxed) {
+                        this3.missed_pings.store(0, Ordering::Relaxed);
+                    } else {
+                        let missed = this3.missed_pings.fetch_add(1, Ordering::Relaxed) + 1;
+                        if missed >= PONG_MISS_LIMIT {
+                            this3
+                                .expire(&format!(
+                                    "pong timeout: {missed} consecutive pings unanswered"
+                                ))
+                                .await;
+                            break;
+                        }
                     }
                     if this3
                         .ctrl_tx
@@ -423,9 +454,23 @@ impl WtConn {
                     )));
                 }
             }
-            FrameType::Pong => {}
+            FrameType::Pong => {
+                self.pong_seen.store(true, Ordering::Relaxed);
+            }
             _ => {}
         }
+    }
+
+    /// Mark the connection dead, log the death reason once, and wake the
+    /// death watcher (the pool maintenance loop redials from here).
+    async fn expire(self: &Arc<Self>, reason: &str) {
+        if self.alive.swap(false, Ordering::Relaxed) {
+            warn!(
+                "wt connection dead: {reason}{}",
+                crate::quic_tune::gap_hint(reason)
+            );
+        }
+        self.close.cancel();
     }
 
     pub async fn open_tcp(self: &Arc<Self>, host: &str, port: u16) -> Result<BoxStream> {
@@ -559,7 +604,9 @@ impl WtConn {
             let conn = self.conn.clone();
             let enc = self.dgram_enc.clone();
             let ctrl = self.ctrl_tx.clone();
-            let udp = self.udp.clone();
+            // Shared Arc<WtConn>: `self.udp.clone()` would deep-copy the
+            // DashMap and remove from the copy instead of the live route.
+            let this = self.clone();
             tokio::spawn(async move {
                 while let Some((dst, data)) = out_rx.recv().await {
                     let mut payload = Vec::with_capacity(24 + data.len());
@@ -582,7 +629,7 @@ impl WtConn {
                         break;
                     }
                 }
-                udp.remove(&sid);
+                this.udp.remove(&sid);
             });
         }
 

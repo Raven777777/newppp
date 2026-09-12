@@ -15,6 +15,21 @@ use std::sync::Arc;
 use quinn_proto::VarInt;
 use wtransport::config::QuicTransportConfig;
 
+/// Detected signature of quinn's stream-reassembly gap guard ("too many gaps
+/// in stream buffer"). On a lossy/reordering path a large receive window lets
+/// too many holes accumulate and quinn aborts the whole connection.
+const GAP_SIGNATURE: &str = "too many gaps";
+
+/// Tuning hint to append when a QUIC connection dies from the gap guard, so
+/// the log line itself tells the operator what to change (D5).
+pub fn gap_hint(reason: &str) -> &'static str {
+    if reason.contains(GAP_SIGNATURE) {
+        " — weak-network tuning hint: lower --recv-window to 1..2 (MB) on the lossy side"
+    } else {
+        ""
+    }
+}
+
 pub fn tuned(recv_window: u32) -> QuicTransportConfig {
     let mut t = QuicTransportConfig::default();
 

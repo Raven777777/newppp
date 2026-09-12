@@ -10,7 +10,8 @@ use std::time::Duration;
 use anyhow::{ensure, Result};
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Semaphore};
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -25,6 +26,8 @@ use super::frame::{FLAG_FIN, FLAG_RST};
 pub const SESSION_BUF: usize = 64 * 1024;
 pub const ROUTE_CHAN: usize = 256;
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum number of slow dial/DNS operations allowed on one fallback mux.
+pub const MAX_MUX_TASKS: usize = 32;
 
 /// Bounded outbound frame queue entry.
 #[derive(Debug)]
@@ -123,19 +126,24 @@ pub enum OpenError {
 
 impl std::fmt::Display for OpenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            OpenError::DialFailed => "dial failed",
-            OpenError::Limit => "session limit reached",
-            OpenError::BadTarget => "invalid target",
-            OpenError::Denied => "denied",
-        };
-        f.write_str(s)
+        f.write_str(self.tag())
     }
 }
 
 impl std::error::Error for OpenError {}
 
 impl OpenError {
+    /// Stable machine-readable classification, surfaced in client logs and
+    /// local-proxy replies so failures can be asserted by category.
+    pub fn tag(self) -> &'static str {
+        match self {
+            OpenError::DialFailed => "dial-failed",
+            OpenError::Limit => "session-limit",
+            OpenError::BadTarget => "bad-target",
+            OpenError::Denied => "private-target-denied",
+        }
+    }
+
     pub fn to_code(self) -> u8 {
         match self {
             OpenError::DialFailed => OPEN_ERR_DIAL,
@@ -298,7 +306,10 @@ impl MuxClient {
 
         // pump: user -> frames
         let cmd = self.inner.cmd_tx.clone();
-        let sessions = self.inner.sessions.clone();
+        // The frames→user pump (below) captures the shared inner (Arc), NOT
+        // `inner.sessions.clone()`: DashMap's Clone deep-copies every entry,
+        // which would keep a second sender clone alive and stop that pump
+        // from ever seeing EOF.
         tokio::spawn(async move {
             let mut chunk = vec![0u8; MAX_PLAINTEXT];
             loop {
@@ -316,11 +327,15 @@ impl MuxClient {
                     Err(_) => break,
                 }
             }
-            // half-close: tell the server we are done sending
+            // Half-close: tell the server we are done sending. The session
+            // route must stay registered — the target may still be sending
+            // its response (the WT path behaves the same way), and dropping
+            // the route here would discard it. The frames→user pump owns
+            // teardown: a server FIN/RST or channel death ends it (a fully
+            // closed user socket simply errors on the next write).
             let _ = cmd
                 .send(OutFrame::new(FrameType::Close, FLAG_FIN, sid, Vec::new()))
                 .await;
-            sessions.remove(&sid);
         });
 
         // pump: frames -> user
@@ -368,7 +383,9 @@ impl MuxClient {
 
         // outbound pump: (dst, data) -> UdpData frames
         let cmd = self.inner.cmd_tx.clone();
-        let udp = self.inner.udp.clone();
+        // Shared inner (Arc): `self.inner.udp.clone()` would deep-copy the
+        // DashMap and remove from the copy instead of the live route.
+        let inner = self.inner.clone();
         tokio::spawn(async move {
             while let Some((dst, data)) = out_rx.recv().await {
                 let mut payload = Vec::with_capacity(24 + data.len());
@@ -382,7 +399,7 @@ impl MuxClient {
                     break;
                 }
             }
-            udp.remove(&sid);
+            inner.udp.remove(&sid);
         });
 
         Ok(UdpPipe {
@@ -464,7 +481,7 @@ async fn handle_client_frame(inner: &Arc<MuxInner>, f: super::frame::Frame) -> b
             }
             if f.flags & FLAG_FIN != 0 {
                 // Half-close from the server: drop the session sender so the
-                // user->frames pump observes channel closure and shuts the
+                // frames->user pump observes channel closure and shuts the
                 // local stream's write side down (same as the WT path). The
                 // final payload was queued above, so ordering is preserved.
                 inner.sessions.remove(&f.sid);
@@ -544,12 +561,38 @@ pub async fn run_server_mux<R: AsyncRead + Unpin>(
     hooks: Arc<dyn ServerHooks>,
     cancel: CancellationToken,
 ) {
+    let permits = Arc::new(Semaphore::new(MAX_MUX_TASKS));
+    let mut workers = JoinSet::new();
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
+            Some(result) = workers.join_next(), if !workers.is_empty() => {
+                if let Err(e) = result {
+                    warn!("server mux worker failed: {e}");
+                }
+            }
             f = reader.read() => {
                 match f {
-                    Ok(Some(f)) =>                     handle_server_frame(&sink, &hooks, f).await,
+                    Ok(Some(f)) => {
+                        let concurrent = matches!(
+                            f.ftype,
+                            FrameType::Open | FrameType::UdpAssociate | FrameType::UdpData
+                        );
+                        if concurrent {
+                            let permit = match permits.clone().acquire_owned().await {
+                                Ok(permit) => permit,
+                                Err(_) => break,
+                            };
+                            let sink = sink.clone();
+                            let hooks = hooks.clone();
+                            workers.spawn(async move {
+                                let _permit = permit;
+                                handle_server_frame(&sink, &hooks, f).await;
+                            });
+                        } else {
+                            handle_server_frame(&sink, &hooks, f).await;
+                        }
+                    }
                     Ok(None) => break,
                     Err(e) => {
                         debug!("server mux: bad frame: {e}");
@@ -560,6 +603,8 @@ pub async fn run_server_mux<R: AsyncRead + Unpin>(
         }
     }
     cancel.cancel();
+    workers.abort_all();
+    workers.join_all().await;
 }
 
 async fn handle_server_frame(
@@ -642,7 +687,7 @@ async fn handle_server_frame(
 mod tests {
     use super::*;
     use crate::proto::frame::Frame;
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     fn data_frame(flags: u16, sid: u32, payload: &[u8]) -> Frame {
@@ -710,11 +755,23 @@ mod tests {
     struct MockHooks {
         feeds: Mutex<Vec<(u32, bool, bool)>>,
         closes: Mutex<Vec<(u32, bool)>>,
+        open_active: Arc<AtomicUsize>,
+        open_max: Arc<AtomicUsize>,
+        open_delay: Duration,
     }
 
     impl ServerHooks for MockHooks {
         fn open_tcp(&self, _sid: u32, _host: String, _port: u16) -> BoxFutOpen {
-            Box::pin(async { Ok(()) })
+            let active = self.open_active.clone();
+            let max = self.open_max.clone();
+            let delay = self.open_delay;
+            Box::pin(async move {
+                let current = active.fetch_add(1, Ordering::Relaxed) + 1;
+                max.fetch_max(current, Ordering::Relaxed);
+                tokio::time::sleep(delay).await;
+                active.fetch_sub(1, Ordering::Relaxed);
+                Ok(())
+            })
         }
         fn feed_tcp(&self, sid: u32, _data: Vec<u8>, fin: bool, rst: bool) -> BoxFutUnit {
             self.feeds.lock().unwrap().push((sid, fin, rst));
@@ -756,5 +813,39 @@ mod tests {
         handle_server_frame(&test_sink(), &dyn_hooks, close_frame(0, 4)).await;
         assert_eq!(*hooks.closes.lock().unwrap(), vec![(3, true), (4, false)]);
         assert!(hooks.feeds.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn server_mux_bounds_concurrent_open_work() -> Result<()> {
+        let hooks = Arc::new(MockHooks {
+            open_delay: Duration::from_millis(20),
+            ..Default::default()
+        });
+        let cipher = Arc::new(FrameCipher::new(&[0x42; 32]));
+        let (client, server) = tokio::io::duplex(256 * 1024);
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let (sink_tx, mut sink_rx) = mpsc::channel(MAX_MUX_TASKS * 2);
+        let runner = tokio::spawn(run_server_mux(
+            FrameReader::new(server, Some(cipher.clone()), None),
+            FrameSink::Chan(sink_tx),
+            hooks.clone(),
+            server_cancel,
+        ));
+
+        let enc = FrameEncoder::new(cipher, super::super::crypto::CounterGen::stream());
+        let mut client = client;
+        for sid in 1..=(MAX_MUX_TASKS as u32 * 2) {
+            let frame = enc.encode(FrameType::Open, 0, sid, &encode_open("example.com", 443))?;
+            client.write_all(&frame).await?;
+        }
+        for _ in 0..(MAX_MUX_TASKS * 2) {
+            let reply = sink_rx.recv().await.expect("open reply");
+            assert_eq!(reply.ftype, FrameType::OpenOk);
+        }
+        cancel.cancel();
+        runner.await.unwrap();
+        assert!(hooks.open_max.load(Ordering::Relaxed) <= MAX_MUX_TASKS);
+        Ok(())
     }
 }

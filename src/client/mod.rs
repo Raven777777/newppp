@@ -28,7 +28,7 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
     let ob = Outbound::build(&cfg).await?;
     info!("newppp client up (outbound: {})", ob.describe());
 
-    let socks = tokio::spawn({
+    let mut socks = tokio::spawn({
         let ob = ob.clone();
         let bind = cfg.socks_bind.clone();
         let auth = cfg.inbound_auth.clone();
@@ -48,17 +48,21 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
         _ = tokio::signal::ctrl_c() => {
             info!("shutdown signal received");
         }
-        r = socks => {
+        r = &mut socks => {
             r??;
         }
         r = async {
-            match http_task {
+            match http_task.as_mut() {
                 Some(t) => t.await,
                 None => std::future::pending().await,
             }
         } => {
             r??;
         }
+    }
+    socks.abort();
+    if let Some(task) = http_task {
+        task.abort();
     }
     Ok(())
 }

@@ -87,8 +87,9 @@ pub fn spawn(url: &str) {
                 }
             }
             if !synced {
-                let e = last_err.expect("at least one attempt was made");
-                warn!("clock sync with {url} failed after {SYNC_ATTEMPTS} attempts: {e}; keeping old offset");
+                if let Some(e) = last_err {
+                    warn!("clock sync with {url} failed after {SYNC_ATTEMPTS} attempts: {e}; keeping old offset");
+                }
             }
         }
     });

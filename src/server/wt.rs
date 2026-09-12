@@ -38,7 +38,15 @@ pub async fn run_wt(
     loop {
         let incoming = endpoint.accept().await;
         let st = st.clone();
+        let remote = incoming.remote_address();
         tokio::spawn(async move {
+            // Unauthenticated-connection gate (D1): held until the in-band
+            // AUTH frame verifies, then released so authenticated sessions
+            // are not throttled by it.
+            let Some(guard) = st.unauth.try_admit(Some(remote.ip())) else {
+                debug!("refusing connection from {remote}: unauthenticated cap reached");
+                return;
+            };
             let request = match incoming.await {
                 Ok(r) => r,
                 Err(e) => {
@@ -60,8 +68,9 @@ pub async fn run_wt(
                     return;
                 }
             };
-            if let Err(e) = handle_wt_conn(st, conn).await {
-                debug!("wt conn ended: {e:#}");
+            if let Err(e) = handle_wt_conn(st, conn, guard).await {
+                let msg = format!("{e:#}");
+                debug!("wt conn ended: {msg}{}", crate::quic_tune::gap_hint(&msg));
             }
         });
     }
@@ -74,7 +83,11 @@ fn header_value(headers: &std::collections::HashMap<String, String>, name: &str)
         .map(|(_, v)| v.clone())
 }
 
-async fn handle_wt_conn(st: Arc<ServerState>, conn: Connection) -> Result<()> {
+async fn handle_wt_conn(
+    st: Arc<ServerState>,
+    conn: Connection,
+    guard: crate::server::limit::UnauthGuard,
+) -> Result<()> {
     // ---- control stream: first bidi stream carries the AUTH handshake ----
     let (send, recv) = conn.accept_bi().await?;
     let mut reader = FrameReader::new(recv, None, None);
@@ -88,17 +101,29 @@ async fn handle_wt_conn(st: Arc<ServerState>, conn: Connection) -> Result<()> {
         }
     };
 
-    let Some((uid, static_key, ap)) = crate::server::auth_from_frame(&st, &auth_frame) else {
+    let (uid, static_key, ap) = match crate::server::auth_from_frame(&st, &auth_frame) {
+        crate::server::AuthOutcome::Ok(uid, key, ap) => (uid, key, ap),
+        crate::server::AuthOutcome::VersionMismatch { client, server } => {
+            // Explicit, greppable error: the peer authenticated but speaks a
+            // different protocol version. Upgrade both ends together.
+            tracing::error!(
+                "wt auth: protocol version mismatch (client={client}, server={server}); \
+                 this build requires both ends on proto v{server}"
+            );
+            return Ok(());
+        }
         // Failed in-band auth: quietly disappear (stealth).
-        return Ok(());
+        crate::server::AuthOutcome::Rejected => return Ok(()),
     };
+    // Authenticated: this connection no longer counts against the unauth cap.
+    drop(guard);
 
     let session_key = crypto::derive_session_key(&static_key, &ap.salt);
     let cipher = Arc::new(FrameCipher::new(&session_key));
     reader.set_cipher(cipher.clone());
 
-    let stream_counters = CounterGen::stream();
-    let dgram_counters = CounterGen::datagram();
+    let stream_counters = CounterGen::stream_server();
+    let dgram_counters = CounterGen::datagram_server();
     let mut writer = FrameWriter::new(send, cipher.clone(), stream_counters.clone());
     writer.write(FrameType::AuthOk, 0, 0, &[]).await?;
     info!("wt conn authenticated uid={uid}");
@@ -138,7 +163,6 @@ async fn handle_wt_conn(st: Arc<ServerState>, conn: Connection) -> Result<()> {
         }
     });
 
-    let sink_ctrl = FrameSink::Chan(ctrl_tx.clone());
     let sink_dgram = FrameSink::Datagram {
         conn: conn.clone(),
         enc: Arc::new(FrameEncoder::new(cipher.clone(), dgram_counters.clone())),
@@ -150,7 +174,7 @@ async fn handle_wt_conn(st: Arc<ServerState>, conn: Connection) -> Result<()> {
         let st2 = st.clone();
         let cs2 = conn_state.clone();
         let sink_dgram2 = sink_dgram.clone();
-        let sink_ctrl2 = sink_ctrl.clone();
+        let sink_ctrl2 = FrameSink::Chan(ctrl_tx.clone());
         tokio::spawn(async move {
             while let Ok(Some(f)) = reader.read().await {
                 match f.ftype {
@@ -186,8 +210,13 @@ async fn handle_wt_conn(st: Arc<ServerState>, conn: Connection) -> Result<()> {
                             hooks.udp_feed(f.sid, dst, r.rest().to_vec()).await;
                         }
                     }
-                    FrameType::Close => {
-                        cs2.drop_session(f.sid);
+                    FrameType::Close | FrameType::Error
+                        // Release only when this call actually removed the
+                        // registered handle (parity with hub.rs close_tcp);
+                        // duplicate frames must not corrupt the global quota.
+                        if cs2.drop_session(f.sid) =>
+                    {
+                        st2.release_session();
                     }
                     _ => {}
                 }
@@ -275,6 +304,5 @@ async fn handle_wt_conn(st: Arc<ServerState>, conn: Connection) -> Result<()> {
             }
         }
     }
-    let _ = sink_ctrl; // keep alive till here
     Ok(())
 }

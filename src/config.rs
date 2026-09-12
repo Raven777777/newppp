@@ -115,6 +115,16 @@ pub struct Cli {
     /// [server] idle session timeout, seconds
     #[arg(long = "idle", value_name = "SECS", default_value_t = 60)]
     pub idle_secs: u64,
+
+    /// [server] allow connections to loopback, private, link-local and other
+    /// non-public addresses (disabled by default to prevent SSRF)
+    #[arg(long = "allow-private-targets")]
+    pub allow_private_targets: bool,
+
+    /// [server] global cap on concurrent unauthenticated connections (accepted
+    /// but no valid AUTH frame yet); per-source-IP cap is max_unauth/8 (2..=64)
+    #[arg(long = "max-unauth", value_name = "N", default_value_t = 128)]
+    pub max_unauth: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +160,8 @@ pub struct ServerConfig {
     pub max_sessions: usize,
     pub rate_mbps: u64,
     pub idle_secs: u64,
+    pub allow_private_targets: bool,
+    pub max_unauth: u64,
     pub recv_window: u32,
 }
 
@@ -187,6 +199,37 @@ fn parse_inbound_auth(raw: &str) -> anyhow::Result<(String, String)> {
     Ok((u.to_string(), p.to_string()))
 }
 
+/// Warn when `--listen` carries a specific IP address. The WebTransport
+/// listener uses QUIC `with_bind_default`, which always binds the wildcard
+/// address, so a specific IP is silently ignored (D6: make it visible).
+fn warn_listen_ip_ignored(addr: &str) {
+    if let Ok(sa) = addr.parse::<std::net::SocketAddr>() {
+        if !sa.ip().is_unspecified() {
+            tracing::warn!(
+                "--listen {addr}: IP part is ignored — WebTransport always binds all \
+                 interfaces (udp 0.0.0.0/::). Restrict access with a firewall."
+            );
+        }
+    }
+}
+
+/// Warn when an inbound proxy listener is bound to a wildcard address without
+/// `--inbound-auth`: that exposes an open proxy to the whole network.
+fn warn_open_inbound(label: &str, addr: &str, has_auth: bool) {
+    if has_auth {
+        return;
+    }
+    if let Ok(sa) = addr.parse::<std::net::SocketAddr>() {
+        if sa.ip().is_unspecified() {
+            tracing::warn!(
+                "{label} {addr}: bound to all interfaces without --inbound-auth — the \
+                 local proxy is reachable from the network unauthenticated. Set \
+                 --inbound-auth or bind 127.0.0.1."
+            );
+        }
+    }
+}
+
 impl Cli {
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.client == self.server {
@@ -206,6 +249,10 @@ impl Cli {
             self.server_url.is_some() || self.url.is_some(),
             "client needs --server (WebTransport) and/or --url (HTTPS fallback)"
         );
+        warn_open_inbound("--bind", &self.bind, self.inbound_auth.is_some());
+        if let Some(hb) = &self.http_bind {
+            warn_open_inbound("--http-bind", hb, self.inbound_auth.is_some());
+        }
         Ok(ClientConfig {
             wt_url: self.server_url.clone(),
             fb_url: self.url.clone(),
@@ -228,6 +275,9 @@ impl Cli {
             self.listen.is_some() || self.fallback_listen.is_some(),
             "server needs --listen (WebTransport) and/or --fallback-listen (HTTPS fallback)"
         );
+        if let Some(l) = &self.listen {
+            warn_listen_ip_ignored(l);
+        }
         let cert = if self.self_signed {
             CertSource::SelfSigned
         } else {
@@ -254,6 +304,8 @@ impl Cli {
             max_sessions: self.max_sessions.max(1),
             rate_mbps: self.rate_mbps,
             idle_secs: self.idle_secs.max(5),
+            allow_private_targets: self.allow_private_targets,
+            max_unauth: self.max_unauth.max(1),
             recv_window: recv_window_bytes(self.recv_window_mb)?,
         })
     }

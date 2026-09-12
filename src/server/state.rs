@@ -1,4 +1,4 @@
-﻿//! Server-wide and per-connection state.
+//! Server-wide and per-connection state.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::proto::crypto::{CounterGen, FrameCipher, AUTH_WINDOW};
-use crate::server::limit::RateLimiter;
+use crate::server::limit::{RateLimiter, UnauthGate};
 
 /// Upper bound for the replay-nonce cache; expired entries are purged when
 /// it is exceeded (instead of clearing the whole table, which would open a
@@ -74,20 +74,35 @@ impl ConnState {
     /// when the connection dies (or is swept), every session is cancelled
     /// and its global quota released.
     pub fn register(&self, sid: u32) -> CancellationToken {
-        self.last_active
-            .store(now_millis(), std::sync::atomic::Ordering::Relaxed);
         let token = self.cancel.child_token();
-        self.sessions
-            .insert(sid, Arc::new(SessionHandle::from_token(token.clone())));
+        debug_assert!(
+            self.try_register_with(sid, token.clone()).is_some(),
+            "session sid {sid} already registered"
+        );
         token
     }
 
-    pub fn register_with(&self, sid: u32, token: CancellationToken) -> Arc<SessionHandle> {
+    /// Atomically register a session handle for `sid`. Returns `None` when the
+    /// sid is already taken, so callers can release any quota they acquired
+    /// instead of silently overwriting (and leaking) the existing handle.
+    ///
+    /// TCP and UDP sessions both go through this one namespace, so a UDP
+    /// associate can never clobber a TCP session's handle.
+    pub fn try_register_with(
+        &self,
+        sid: u32,
+        token: CancellationToken,
+    ) -> Option<Arc<SessionHandle>> {
         self.last_active
             .store(now_millis(), std::sync::atomic::Ordering::Relaxed);
-        let h = Arc::new(SessionHandle::from_token(token));
-        self.sessions.insert(sid, h.clone());
-        h
+        match self.sessions.entry(sid) {
+            dashmap::mapref::entry::Entry::Occupied(_) => None,
+            dashmap::mapref::entry::Entry::Vacant(e) => {
+                let h = Arc::new(SessionHandle::from_token(token));
+                e.insert(h.clone());
+                Some(h)
+            }
+        }
     }
 
     /// Tear down a session. Returns true when a registered session handle
@@ -157,8 +172,12 @@ pub struct ServerState {
     pub max_sessions: usize,
     pub rate_mbps: u64,
     pub idle: Duration,
+    pub allow_private_targets: bool,
+    /// Cap on concurrent connections that have not completed in-band AUTH yet.
+    pub unauth: Arc<UnauthGate>,
     /// uid -> replay-nonce cache; value is the auth timestamp used for expiry.
     pub seen_nonces: DashMap<String, u64>,
+    pub(crate) nonce_lock: std::sync::Mutex<()>,
     pub path: String,
 }
 
@@ -180,21 +199,28 @@ impl ServerState {
     }
 
     pub fn release_session(&self) {
-        self.active_sessions.fetch_sub(1, Ordering::Relaxed);
+        let prev = self.active_sessions.fetch_sub(1, Ordering::Relaxed);
+        // A mismatched release would wrap to `u64::MAX` and permanently lock
+        // out every new session; catch any regression in debug builds while
+        // keeping release behavior unchanged.
+        debug_assert!(
+            prev > 0,
+            "session quota released without a matching acquire"
+        );
     }
 
     pub fn check_and_remember_nonce(&self, uid: &str, nonce: &[u8], ts: u64) -> bool {
+        let _guard = self.nonce_lock.lock().unwrap_or_else(|e| e.into_inner());
         let key = format!("{uid}|{ts}|{}", crate::proto::crypto::hex(nonce));
-        if self.seen_nonces.insert(key, ts).is_some() {
+        if self.seen_nonces.contains_key(&key) {
             return false;
         }
-        if self.seen_nonces.len() > NONCE_CAP {
-            // Purge only entries that are past any plausible auth window so
-            // captured nonces stay rejected; only authenticated users can
-            // insert here, so the cache cannot be flooded anonymously.
-            let cutoff = crate::proto::crypto::now_unix().saturating_sub(2 * AUTH_WINDOW);
-            self.seen_nonces.retain(|_, v| *v > cutoff);
+        let cutoff = crate::proto::crypto::now_unix().saturating_sub(2 * AUTH_WINDOW);
+        self.seen_nonces.retain(|_, v| *v > cutoff);
+        if self.seen_nonces.len() >= NONCE_CAP {
+            return false;
         }
+        self.seen_nonces.insert(key, ts);
         true
     }
 
@@ -264,7 +290,10 @@ mod tests {
             max_sessions: 10,
             rate_mbps: 0,
             idle: Duration::from_secs(60),
+            allow_private_targets: false,
+            unauth: Arc::new(UnauthGate::new(128, 16)),
             seen_nonces: DashMap::new(),
+            nonce_lock: std::sync::Mutex::new(()),
             path: "/api/ppp".into(),
         }
     }
@@ -274,7 +303,7 @@ mod tests {
             id,
             uid: "u".into(),
             cipher: Arc::new(FrameCipher::new(&[0u8; 32])),
-            stream_counters: CounterGen::stream(),
+            stream_counters: CounterGen::stream_server(),
             rate: RateLimiter::new(0),
             cancel: CancellationToken::new(),
             sessions: Default::default(),
@@ -291,6 +320,20 @@ mod tests {
         conn.register(7);
         assert!(conn.drop_session(7));
         assert!(!conn.drop_session(7));
+    }
+
+    /// Atomic registration must refuse a duplicate sid instead of overwriting
+    /// the existing handle (which would orphan its token and leak its quota).
+    #[test]
+    fn try_register_rejects_duplicate_sid() {
+        let conn = test_conn(1);
+        assert!(conn
+            .try_register_with(7, conn.cancel.child_token())
+            .is_some());
+        assert!(conn
+            .try_register_with(7, conn.cancel.child_token())
+            .is_none());
+        assert!(conn.drop_session(7));
     }
 
     #[test]

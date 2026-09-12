@@ -102,8 +102,24 @@ impl FrameCipher {
     }
 }
 
-/// Monotonic nonce counter generator. Stream frames and datagrams use two
-/// disjoint generators (high bit set for datagrams).
+/// Monotonic nonce counter generator.
+///
+/// The 64-bit counter space is split into four disjoint ranges. Both peers of
+/// a session share the same session key, so in addition to separating stream
+/// frames from datagrams the ranges must also separate the two *directions* —
+/// otherwise a client stream frame and a server stream frame can carry the
+/// same counter, i.e. the same AEAD nonce under the same key, which is
+/// catastrophic for both confidentiality and integrity.
+///
+/// | channel       | direction | range                     |
+/// |---------------|-----------|---------------------------|
+/// | stream frames | client    | `[1, 2^62)`               |
+/// | stream frames | server    | `[2^62, 2^63)`            |
+/// | datagrams     | client    | `[2^63, 2^63 + 2^62)`     |
+/// | datagrams     | server    | `[2^63 + 2^62, 2^64)`     |
+///
+/// Sharing one generator across every stream of a single direction is what
+/// keeps counters unique within that direction.
 #[derive(Clone)]
 pub struct CounterGen {
     base: u64,
@@ -111,6 +127,7 @@ pub struct CounterGen {
 }
 
 impl CounterGen {
+    /// Client-side stream frames (also fine for tests and benchmarks).
     pub fn stream() -> Self {
         Self {
             base: 1,
@@ -118,9 +135,26 @@ impl CounterGen {
         }
     }
 
+    /// Server-side stream frames — disjoint from [`CounterGen::stream`].
+    pub fn stream_server() -> Self {
+        Self {
+            base: 1u64 << 62,
+            next: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Client-side datagrams.
     pub fn datagram() -> Self {
         Self {
             base: 1u64 << 63,
+            next: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Server-side datagrams — disjoint from [`CounterGen::datagram`].
+    pub fn datagram_server() -> Self {
+        Self {
+            base: (1u64 << 63) | (1u64 << 62),
             next: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -291,6 +325,10 @@ pub fn unhex(s: &str) -> Option<Vec<u8>> {
 /// sealed with the user's *static* key).
 #[derive(Clone, Debug)]
 pub struct AuthPayload {
+    /// Explicit protocol version, checked by the server so a version skew
+    /// surfaces as a named mismatch instead of a generic decrypt/decode
+    /// failure.
+    pub proto_version: u8,
     pub salt: [u8; SALT_LEN],
     pub ts: u64,
     pub nonce: [u8; SALT_LEN],
@@ -300,7 +338,8 @@ pub struct AuthPayload {
 
 impl AuthPayload {
     pub fn encode(&self) -> Vec<u8> {
-        let mut v = Vec::with_capacity(16 + 8 + 16 + 1 + self.uid.len() + 32);
+        let mut v = Vec::with_capacity(1 + 16 + 8 + 16 + 1 + self.uid.len() + 32);
+        v.push(self.proto_version);
         v.extend_from_slice(&self.salt);
         v.extend_from_slice(&self.ts.to_le_bytes());
         v.extend_from_slice(&self.nonce);
@@ -311,8 +350,13 @@ impl AuthPayload {
     }
 
     pub fn decode(b: &[u8]) -> Result<Self> {
-        ensure!(b.len() >= 16 + 8 + 16 + 1 + 32, "auth payload truncated");
+        ensure!(
+            b.len() >= 1 + 16 + 8 + 16 + 1 + 32,
+            "auth payload truncated"
+        );
         let mut p = 0;
+        let proto_version = b[p];
+        p += 1;
         let mut salt = [0u8; SALT_LEN];
         salt.copy_from_slice(&b[p..p + 16]);
         p += 16;
@@ -331,12 +375,19 @@ impl AuthPayload {
         let mut mac = [0u8; MAC_LEN];
         mac.copy_from_slice(&b[p..p + 32]);
         Ok(Self {
+            proto_version,
             salt,
             ts,
             nonce,
             uid,
             mac,
         })
+    }
+
+    /// Compare the peer's advertised protocol version with the local one.
+    /// A mismatch is a configuration error, not an authentication failure.
+    pub fn proto_version_compatible(&self) -> bool {
+        self.proto_version == crate::proto::frame::PROTO_VERSION
     }
 
     pub fn verify(&self, static_key: &[u8; KEY_LEN], window: u64) -> bool {
@@ -392,6 +443,37 @@ mod tests {
         assert!(d0 >= (1u64 << 63));
     }
 
+    /// Client and server share the session key, so the four
+    /// channel/direction counter ranges must never overlap: an overlap means
+    /// two frames encrypt different plaintexts under the same AEAD nonce.
+    #[test]
+    fn counter_spaces_are_direction_disjoint() {
+        const N: u64 = 1_000_000;
+        let mut ranges = [
+            (CounterGen::stream(), "client stream"),
+            (CounterGen::stream_server(), "server stream"),
+            (CounterGen::datagram(), "client datagram"),
+            (CounterGen::datagram_server(), "server datagram"),
+        ]
+        .map(|(g, name)| {
+            let first = g.next();
+            let mut last = first;
+            for _ in 1..N {
+                last = g.next();
+            }
+            (first, last, name)
+        });
+        ranges.sort_by_key(|(first, _, _)| *first);
+        for pair in ranges.windows(2) {
+            let (af, al, an) = pair[0];
+            let (bf, _, bn) = pair[1];
+            assert!(
+                al < bf,
+                "AEAD counter ranges overlap: {an} [{af}, {al}] vs {bn} starts at {bf}"
+            );
+        }
+    }
+
     #[test]
     fn bearer_roundtrip() {
         let key = derive_static_key("pw", "alice");
@@ -416,6 +498,7 @@ mod tests {
         let key = derive_static_key("pw", "u1");
         let nonce = [0u8; SALT_LEN];
         let ap = AuthPayload {
+            proto_version: crate::proto::frame::PROTO_VERSION,
             salt: [0u8; SALT_LEN],
             ts: u64::MAX,
             nonce,
@@ -433,6 +516,7 @@ mod tests {
         let ts = now_unix();
         let mac = auth_mac(&key, "u1", ts, &nonce);
         let ap = AuthPayload {
+            proto_version: crate::proto::frame::PROTO_VERSION,
             salt: [9u8; 16],
             ts,
             nonce,
@@ -442,7 +526,18 @@ mod tests {
         let enc = ap.encode();
         let dec = AuthPayload::decode(&enc).unwrap();
         assert!(dec.verify(&key, AUTH_WINDOW));
+        assert!(dec.proto_version_compatible());
         assert_eq!(dec.salt, [9u8; 16]);
+
+        // A wrong version must survive decode and be reported as incompatible
+        // (not swallowed by a generic decrypt failure).
+        let skewed = AuthPayload {
+            proto_version: crate::proto::frame::PROTO_VERSION.wrapping_add(1),
+            ..ap.clone()
+        };
+        let dec = AuthPayload::decode(&skewed.encode()).unwrap();
+        assert!(!dec.proto_version_compatible());
+        assert!(dec.verify(&key, AUTH_WINDOW)); // still authenticated
 
         // stale timestamp must be rejected
         let old = AuthPayload {
@@ -486,8 +581,16 @@ mod proptests {
         ) {
             let key = derive_static_key("pw", &uid);
             let mac = auth_mac(&key, &uid, ts, &nonce);
-            let ap = AuthPayload { salt, ts, nonce, uid: uid.clone(), mac };
+            let ap = AuthPayload {
+                proto_version: crate::proto::frame::PROTO_VERSION,
+                salt,
+                ts,
+                nonce,
+                uid: uid.clone(),
+                mac,
+            };
             let dec = AuthPayload::decode(&ap.encode()).expect("valid encoding");
+            prop_assert_eq!(dec.proto_version, crate::proto::frame::PROTO_VERSION);
             prop_assert_eq!(dec.salt, salt);
             prop_assert_eq!(dec.ts, ts);
             prop_assert_eq!(dec.nonce, nonce);

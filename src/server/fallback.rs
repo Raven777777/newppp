@@ -63,6 +63,12 @@ pub fn disguise_response() -> Response {
 }
 
 async fn api_handler(State(st): State<Arc<ServerState>>, req: Request) -> Response {
+    // Unauthenticated-connection gate (D1). Fallback peers may sit behind a
+    // CDN, so this is the global cap only (no useful per-IP signal).
+    let Some(guard) = st.unauth.try_admit(None) else {
+        tracing::debug!("fallback: refusing request, unauthenticated cap reached");
+        return disguise_response();
+    };
     let auth = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -77,9 +83,20 @@ async fn api_handler(State(st): State<Arc<ServerState>>, req: Request) -> Respon
     let mut reader = FrameReader::new(StreamAsRead::new(body), None, None);
     reader.decoder_mut().raw = true;
 
-    let Some((uid, static_key, ap)) = read_mode_a_auth(&st, &mut reader).await else {
-        return disguise_response();
+    let (uid, static_key, ap) = match read_mode_a_auth(&st, &mut reader).await {
+        crate::server::AuthOutcome::Ok(uid, key, ap) => (uid, key, ap),
+        crate::server::AuthOutcome::VersionMismatch { client, server } => {
+            tracing::error!(
+                "fallback POST auth: protocol version mismatch (client={client}, server={server}); \
+                 this build requires both ends on proto v{server}"
+            );
+            return disguise_response();
+        }
+        crate::server::AuthOutcome::Rejected => return disguise_response(),
     };
+    // Authenticated: stop counting this request against the unauth cap before
+    // the long-lived channel starts.
+    drop(guard);
 
     let (resp_tx, resp_rx) = mpsc::channel::<Bytes>(256);
     spawn_mode_a_channel(st, uid, static_key, ap, reader, resp_tx);
@@ -122,6 +139,11 @@ async fn ws_handler(State(st): State<Arc<ServerState>>, req: Request) -> Respons
 }
 
 async fn ws_channel(st: Arc<ServerState>, socket: WebSocket) {
+    // Global unauthenticated-connection gate (D1); held until AUTH verifies.
+    let Some(guard) = st.unauth.try_admit(None) else {
+        tracing::debug!("fallback WS: refusing channel, unauthenticated cap reached");
+        return; // dropping the socket closes it quietly
+    };
     let (mut sink, mut stream) = socket.split();
 
     // incoming binary messages -> AsyncRead for the frame decoder
@@ -147,10 +169,20 @@ async fn ws_channel(st: Arc<ServerState>, socket: WebSocket) {
     );
     reader.decoder_mut().raw = true;
 
-    let Some((uid, static_key, ap)) = read_mode_a_auth(&st, &mut reader).await else {
+    let (uid, static_key, ap) = match read_mode_a_auth(&st, &mut reader).await {
+        crate::server::AuthOutcome::Ok(uid, key, ap) => (uid, key, ap),
+        crate::server::AuthOutcome::VersionMismatch { client, server } => {
+            tracing::error!(
+                "fallback WS auth: protocol version mismatch (client={client}, server={server}); \
+                 this build requires both ends on proto v{server}"
+            );
+            return;
+        }
         // Post-upgrade auth failure: quietly close (stealth).
-        return;
+        crate::server::AuthOutcome::Rejected => return,
     };
+    // Authenticated: release the unauth slot before the long-lived channel.
+    drop(guard);
 
     // encoded frames -> WS binary messages
     let (resp_tx, mut resp_rx) = mpsc::channel::<Bytes>(256);
@@ -170,7 +202,7 @@ async fn ws_channel(st: Arc<ServerState>, socket: WebSocket) {
 async fn read_mode_a_auth<R>(
     st: &Arc<ServerState>,
     reader: &mut FrameReader<R>,
-) -> Option<(String, [u8; 32], AuthPayload)>
+) -> crate::server::AuthOutcome
 where
     R: AsyncRead + Unpin,
 {
@@ -178,7 +210,7 @@ where
         Ok(Ok(Some(f))) if f.ftype == FrameType::Auth => f,
         _ => {
             warn!("fallback: missing/bad in-band auth");
-            return None;
+            return crate::server::AuthOutcome::Rejected;
         }
     };
     crate::server::auth_from_frame(st, &auth_frame)
@@ -206,7 +238,7 @@ fn spawn_mode_a_channel<R>(
         id: conn_id,
         uid,
         cipher: cipher.clone(),
-        stream_counters: CounterGen::stream(),
+        stream_counters: CounterGen::stream_server(),
         rate: RateLimiter::new(st.rate_mbps),
         cancel: cancel.clone(),
         sessions: Default::default(),

@@ -9,7 +9,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
-use crate::client::outbound::Outbound;
+use crate::client::outbound::{socks5_reply_code, Outbound};
 use crate::proto::addr::{build_socks5_udp, parse_socks5_udp};
 
 const UDP_IDLE: Duration = Duration::from_secs(300);
@@ -148,7 +148,7 @@ async fn connect_cmd(mut sock: TcpStream, ob: Outbound, target: (String, u16)) -
             Ok(())
         }
         Err(e) => {
-            reply(&mut sock, 1).await.ok();
+            reply(&mut sock, socks5_reply_code(&e)).await.ok();
             Err(e)
         }
     }
@@ -170,7 +170,7 @@ async fn udp_cmd(mut sock: TcpStream, ob: Outbound) -> Result<()> {
     let mut pipe = match ob.udp_associate().await {
         Ok(p) => p,
         Err(e) => {
-            reply(&mut sock, 1).await.ok();
+            reply(&mut sock, socks5_reply_code(&e)).await.ok();
             return Err(e);
         }
     };
