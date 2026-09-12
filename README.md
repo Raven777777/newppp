@@ -291,6 +291,7 @@ newppp -c --auth alice:secret123 \
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `--auth` | 必填 | `user:pass`，可重复注册多用户（uid 限 `[A-Za-z0-9_-]{1,32}`） |
+| `--time` | pool.ntp.org | 内部时钟的 NTP 服务器（客户端+服务端均可用，见下方「内部时钟」） |
 | `--listen` | - | WebTransport (QUIC/UDP) 监听；**省略则完全不监听 UDP**（形态 B 纯网站形态）。注意：提供时仅端口生效，IP 部分被忽略（总是绑定全部接口） |
 | `--cert/--key` | - | TLS PEM（或 `--self-signed` 自签调试） |
 | `--fallback-listen` | - | TLS TCP 降级/伪装站监听（模式 A POST + WebSocket 双承载） |
@@ -308,6 +309,7 @@ newppp -c --auth alice:secret123 \
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `--auth` | 必填 | `user:pass`（取第一组） |
+| `--time` | pool.ntp.org | 内部时钟的 NTP 服务器（客户端+服务端均可用，见下方「内部时钟」） |
 | `--server` | - | WT 服务端 URL（https://host[:port][/path]） |
 | `--url` | - | 模式 A 降级 URL，scheme 决定承载：`https://`（双工 POST，直连用）或 `wss://`（WebSocket，套 Cloudflare 必用）；与 `--server` 至少配一个 |
 | `--bind` | 127.0.0.1:1080 | SOCKS5 监听（CONNECT / UDP ASSOCIATE） |
@@ -354,6 +356,21 @@ newppp -c --auth alice:secret123 \
 * **认证失败不返回 401**：WT 会话请求返回 404；HTTP 降级端点返回伪装页（200）
 * 只用标准 Header，UA 伪装 Chrome
 * 隐私边界与威胁模型取舍见下方「隐私与安全模型」章节
+
+### 内部时钟（NTP 校准）
+
+认证时间戳有 ±60s 窗口，要求两端时钟大致一致。现实部署中客户端机器时钟漂移几十秒并不罕见（**快 60s 以上时认证全部被拒**，表现为 `server rejected WebTransport session request` / `server rejected authentication`）。为此进程不直接信任系统时钟：
+
+* 内部维护 UTC 时钟 `now = 系统时钟 + offset`，offset 由 SNTP 校准得出（内置客户端，无额外依赖）；
+* **启动时立即同步一次，之后每 1 小时重新校准**；
+* `--time` 可指定 NTP 服务器（`pool.ntp.org` 默认，支持 `host` / `host:port`）；
+* 首次同步成功前退化为系统时钟；同步失败不阻塞启动、保留旧 offset 并告警；
+* 客户端与服务端都校准：即使两端各差几十秒，校准后都贴近真实 UTC，±60s 窗口自然满足。
+
+```bash
+newppp -c ... --time ntp.aliyun.com     # 客户端
+newppp -s ... --time 203.107.6.88:123   # 服务端
+```
 
 ### 会话生命周期与稳健性
 
@@ -428,7 +445,7 @@ newppp -c --auth alice:secret123 \
 cargo build --release                              # 产物 target/release/newppp
 cargo fmt --all -- --check                         # 格式检查
 cargo clippy --all-targets -- -D warnings          # 静态检查（0 警告基线）
-cargo test                                         # 单元测试 + property 测试（47 项，含回归）
+cargo test                                         # 单元测试 + property 测试（49 项，含回归）
 cargo bench --bench frame                          # 帧热路径 criterion 基准
 ```
 
@@ -453,6 +470,7 @@ src/
 ├── main.rs            # 入口：-c/-s 分发（薄封装，调用 lib）
 ├── lib.rs             # 库入口（供 bench/集成测试复用）
 ├── config.rs          # CLI 与运行时配置
+├── clock.rs           # 内部 UTC 时钟：SNTP 校准（--time），认证时间戳来源
 ├── quic_tune.rs       # 共享 QUIC 传输调优（可调窗口 + BBR 拥塞控制）
 ├── proto/             # 共享协议层
 │   ├── frame.rs       #   帧编解码（头/AAD/计数器/滑动窗口/异步读写器/坏帧恢复）

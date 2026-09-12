@@ -197,10 +197,9 @@ pub fn auth_mac(key: &[u8; KEY_LEN], uid: &str, ts: u64, nonce: &[u8; SALT_LEN])
 }
 
 pub fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    // Delegates to the calibrated internal clock (see crate::clock): NTP-synced
+    // when the SNTP loop has run at least once, system clock otherwise.
+    crate::clock::now_unix()
 }
 
 /// Bearer token: "uid.ts.nonce_hex.mac_hex" (standard Authorization header only).

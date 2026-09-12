@@ -20,6 +20,7 @@ fn main() -> Result<()> {
 
     runtime.block_on(async move {
         let _ = rustls::crypto::ring::default_provider().install_default();
+        newppp::clock::spawn(&cli.time);
         if cli.server {
             let cfg = cli.server_config()?;
             newppp::server::run(cfg).await
