@@ -24,9 +24,13 @@ pub struct Cli {
     #[arg(long = "log", value_name = "LEVEL", default_value = "info")]
     pub log: String,
 
-    /// [client+server] NTP server for the internal clock (hourly SNTP sync,
-    /// UTC). Hostname, host:port, or host:port:protocol
-    #[arg(long = "time", value_name = "SERVER", default_value = "pool.ntp.org")]
+    /// [client+server] time source URL for the internal clock (hourly sync
+    /// from the HTTP Date header, UTC); e.g. https://time.ms/
+    #[arg(
+        long = "time",
+        value_name = "URL",
+        default_value = "https://www.cloudflare.com/cdn-cgi/trace"
+    )]
     pub time: String,
 
     // ---------------- client options ----------------

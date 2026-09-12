@@ -116,7 +116,7 @@ curl -x http://user:pass@127.0.0.1:8081 https://www.google.com
 
 ## Docker 打包（build_docker.py）
 
-把静态 musl Linux 二进制直接封装成标准 `docker save` 格式（v1.2）镜像 tar——**本机无需安装 Docker**，拷到任意有 Docker 的机器（服务器/NAS）直接 `docker load`。
+把静态 musl Linux 二进制 + Mozilla CA 根证书直接封装成标准 `docker save` 格式（v1.2）镜像 tar——**本机无需安装 Docker**，拷到任意有 Docker 的机器（服务器/NAS）直接 `docker load`。
 
 ### 前置：先出 Linux 二进制
 
@@ -126,17 +126,26 @@ build_linux.bat
 
 产物 `target\x86_64-unknown-linux-musl\release\newppp`（静态链接，无需 libc）。
 
-### 打包
+### 打包（交互式启动脚本）
 
 ```bash
-py -3 build_docker.py                 # 交互输入版本号，生成 newppp-<版本号>.tar
+py -3 build_docker.py
 ```
 
-把参数直接**烧进镜像**（推荐 NAS/无 shell 场景——容器管理器里不再需要填运行命令）：
+依次交互输入**版本号**与**启动参数**（回车打包），例如：
+
+```
+请输入版本号: 1.1.0
+启动参数: -c --auth alice:secret123 --server https://newppp2.love4z.cn --url wss://newppp.love4z.cn/api/ppp --bind 0.0.0.0:1080
+```
+
+启动参数留空则不烧进镜像（运行时在 `docker run` / 容器管理器里填）。打包完成后输出 CA 证书事项与 docker 使用注意（见下方「NAS 容器管理器要点」）。
+
+仍支持原命令行参数（CI 友好）：
 
 ```bash
 py -3 build_docker.py --version 1.0.0 \
-  --args '-c --auth alice:secret123 --server https://newppp2.love4z.cn --url wss://newppp.love4z.cn/api/ppp --bind 0.0.0.0:1080' \
+  --args '-c --auth alice:secret123 --server https://newppp2.love4z.cn --bind 0.0.0.0:1080' \
   -o newppp-client-1.0.0.tar --tag newppp-client:1.0.0
 ```
 
@@ -144,8 +153,10 @@ py -3 build_docker.py --version 1.0.0 \
 |---|---|
 | `--binary` | 二进制路径，默认 `target\x86_64-unknown-linux-musl\release\newppp`（自动校验 ELF/64 位） |
 | `--version` | 版本号（不传则交互输入，作为镜像 tag 与 OCI label） |
-| `--args` | 烧进镜像 Cmd 的启动参数，必须以 `-c` 或 `-s` 开头；`-c` 时 ExposedPorts 自动变为 1080/tcp |
+| `--args` | 烧进镜像 Cmd 的启动参数，必须以 `-c` 或 `-s` 开头；`-c` 时 ExposedPorts 自动变为 1080/tcp（不传则交互输入） |
 | `--tag` / `-o` | 镜像标签与输出文件名，默认 `newppp:<版本号>` / `newppp-<版本号>.tar` |
+
+打包时自动从 curl.se 下载 Mozilla CA bundle 并注入镜像（本地缓存 `.cacert.pem`，删除即强制重新下载）。
 
 ### 导入与运行
 
@@ -163,11 +174,11 @@ docker run -d -p 1080:1080 newppp-client:1.0.0
 
 ### NAS 容器管理器要点
 
+* 镜像已自动注入 Mozilla CA 根证书（`/etc/ssl/certs/ca-certificates.crt`，`build_docker.py` 打包时从 curl.se 下载），scratch 基座的 `UnknownIssuer` 问题已解决，无需 `--skip-verify`；根证书随镜像打包，长期不更新可能过期，重新打包即刷新。
 * 镜像 Cmd 已含完整启动参数时，**「容器运行命令」留空保持默认**，不要填——多数管理器会把整行命令当成单个参数导致 `container startup failed`。
 * 端口映射只加 `本地端口 → 1080/TCP`（客户端）；443/udp、80 是服务端端口，客户端容器不需要。
 * 容器内必须绑 `0.0.0.0`（如 `--bind 0.0.0.0:1080`），写 127.0.0.1 会导致映射失效。
 * `--args` 里的密码会写进镜像配置（`docker inspect` 可见），镜像 tar 请妥善保管。
-* **已知问题：容器内无法校验证书**（scratch 基座没有系统 CA 根证书，WT/wss 均报 `UnknownIssuer`）。应急：`--skip-verify`（不推荐生产）——内层 E2E（密码派生密钥 + AEAD）仍认证加密，窃听解不开流量，但失去 TLS 层服务器身份校验，中间人可盲转发或拒绝服务。正解：把系统 CA 烤进镜像（TODO.md「快速收益」#2），客户端挂载 `SSL_CERT_FILE` 方案实测走不通。
 
 ## 生产部署
 
@@ -292,6 +303,7 @@ newppp -c --auth alice:secret123 \
 |---|---|---|
 | `--auth` | 必填 | `user:pass`，可重复注册多用户（uid 限 `[A-Za-z0-9_-]{1,32}`） |
 | `--time` | pool.ntp.org | 内部时钟的 NTP 服务器（客户端+服务端均可用，见下方「内部时钟」） |
+| `--time` | https://www.cloudflare.com/cdn-cgi/trace | 内部时钟的时间源 URL（HTTP Date 头校准，客户端+服务端均可用，见「内部时钟」） |
 | `--listen` | - | WebTransport (QUIC/UDP) 监听；**省略则完全不监听 UDP**（形态 B 纯网站形态）。注意：提供时仅端口生效，IP 部分被忽略（总是绑定全部接口） |
 | `--cert/--key` | - | TLS PEM（或 `--self-signed` 自签调试） |
 | `--fallback-listen` | - | TLS TCP 降级/伪装站监听（模式 A POST + WebSocket 双承载） |
@@ -309,7 +321,7 @@ newppp -c --auth alice:secret123 \
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `--auth` | 必填 | `user:pass`（取第一组） |
-| `--time` | pool.ntp.org | 内部时钟的 NTP 服务器（客户端+服务端均可用，见下方「内部时钟」） |
+| `--time` | https://www.cloudflare.com/cdn-cgi/trace | 内部时钟的时间源 URL（HTTP Date 头校准，见「内部时钟」） |
 | `--server` | - | WT 服务端 URL（https://host[:port][/path]） |
 | `--url` | - | 模式 A 降级 URL，scheme 决定承载：`https://`（双工 POST，直连用）或 `wss://`（WebSocket，套 Cloudflare 必用）；与 `--server` 至少配一个 |
 | `--bind` | 127.0.0.1:1080 | SOCKS5 监听（CONNECT / UDP ASSOCIATE） |
@@ -357,19 +369,20 @@ newppp -c --auth alice:secret123 \
 * 只用标准 Header，UA 伪装 Chrome
 * 隐私边界与威胁模型取舍见下方「隐私与安全模型」章节
 
-### 内部时钟（NTP 校准）
+### 内部时钟（HTTP Date 校准）
 
 认证时间戳有 ±60s 窗口，要求两端时钟大致一致。现实部署中客户端机器时钟漂移几十秒并不罕见（**快 60s 以上时认证全部被拒**，表现为 `server rejected WebTransport session request` / `server rejected authentication`）。为此进程不直接信任系统时钟：
 
-* 内部维护 UTC 时钟 `now = 系统时钟 + offset`，offset 由 SNTP 校准得出（内置客户端，无额外依赖）；
-* **启动时立即同步一次，之后每 1 小时重新校准**；
-* `--time` 可指定 NTP 服务器（`pool.ntp.org` 默认，支持 `host` / `host:port`）；
+* 内部维护 UTC 时钟 `now = 系统时钟 + offset`，offset 由 HTTPS 响应的 **`Date` 头**（RFC 7231，秒级精度，对 ±60s 窗口绰绰有余）校准得出；
+* **启动时立即同步一次，之后每 1 小时重新校准**；每轮最多 3 次尝试（间隔 2s）；
+* 选 HTTP 而非 NTP 是刻意的：TCP 443 出站几乎不可能被防火墙拦，而 NTP 单次 UDP/123 交换在受限网络/高丢包链路下经常丢失；
+* `--time` 可指定任意 `https://`（或 `http://`）URL（默认 `https://www.cloudflare.com/cdn-cgi/trace`）——任何返回真实 `Date` 头的站点都能当时间源，比如 `https://time.ms/`、`https://acs.m.taobao.com/gw/mtop.common.getTimestamp/`；
 * 首次同步成功前退化为系统时钟；同步失败不阻塞启动、保留旧 offset 并告警；
 * 客户端与服务端都校准：即使两端各差几十秒，校准后都贴近真实 UTC，±60s 窗口自然满足。
 
 ```bash
-newppp -c ... --time ntp.aliyun.com     # 客户端
-newppp -s ... --time 203.107.6.88:123   # 服务端
+newppp -c ... --time https://time.ms/                                      # 客户端（默认 cloudflare）
+newppp -s ... --time https://acs.m.taobao.com/gw/mtop.common.getTimestamp/  # 服务端（国内推荐淘宝接口）
 ```
 
 ### 会话生命周期与稳健性
@@ -470,7 +483,7 @@ src/
 ├── main.rs            # 入口：-c/-s 分发（薄封装，调用 lib）
 ├── lib.rs             # 库入口（供 bench/集成测试复用）
 ├── config.rs          # CLI 与运行时配置
-├── clock.rs           # 内部 UTC 时钟：SNTP 校准（--time），认证时间戳来源
+├── clock.rs           # 内部 UTC 时钟：HTTP Date 头校准（--time），认证时间戳来源
 ├── quic_tune.rs       # 共享 QUIC 传输调优（可调窗口 + BBR 拥塞控制）
 ├── proto/             # 共享协议层
 │   ├── frame.rs       #   帧编解码（头/AAD/计数器/滑动窗口/异步读写器/坏帧恢复）
