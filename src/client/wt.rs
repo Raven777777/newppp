@@ -64,7 +64,7 @@ pub async fn new_pool(cfg: &ClientConfig, url: &str) -> Result<WtPool> {
     // Build the endpoint from the (possibly masqueraded) URL; the resolver
     // must be attached at config time — wtransport's Endpoint exposes no
     // post-construction config mutation for clients.
-    let mut wt_cfg = build_tls_config_inner(cfg.skip_verify, cfg.pin, cfg.recv_window)?;
+    let mut wt_cfg = build_tls_config_inner(cfg.skip_verify, cfg.pin, cfg.recv_window, cfg.conns)?;
     if let Some(r) = resolver {
         wt_cfg.set_dns_resolver(r);
     }
@@ -113,6 +113,13 @@ const PONG_MISS_LIMIT: usize = 2;
 
 /// Base heartbeat period.
 const HEARTBEAT_SECS: u64 = 30;
+
+fn source_cid_len(_conns: usize) -> usize {
+    // The pool may create a temporary extra connection when concurrent
+    // callers race during startup or when a connection reaches its session
+    // limit, even when the configured pool size is one.
+    8
+}
 
 /// Next heartbeat period: 30s ± 20% (24s..36s), uniform. Public for tests.
 fn heartbeat_interval() -> Duration {
@@ -258,6 +265,7 @@ fn build_tls_config_inner(
     skip_verify: bool,
     pin: Option<[u8; 32]>,
     recv_window: u32,
+    conns: usize,
 ) -> Result<WtClientConfig> {
     use wtransport::tls::client::NoServerVerification;
 
@@ -299,8 +307,8 @@ fn build_tls_config_inner(
 
     // Browser fingerprint alignment (borrowed from hysteria's Chrome parrot
     // idea, implemented with the knobs wtransport actually exposes):
-    // * zero-length source CID — Chrome's signature, visible in every UDP
-    //   packet header (quinn defaults to 8 random bytes);
+    // * 8-byte source CID — required because the pool can temporarily create
+    //   multiple connections even when its configured size is one;
     // * 8-byte initial destination CID — Chrome uses 8; quinn defaults to
     //   MAX_CID_SIZE (20), which makes the very first datagram stand out.
     // Both are public configuration on the built config (feature "quinn"),
@@ -310,9 +318,15 @@ fn build_tls_config_inner(
         .with_custom_tls_and_transport(tls, crate::quic_tune::tuned(recv_window))
         .keep_alive_interval(Some(Duration::from_secs(15)))
         .build();
-    config
-        .quic_endpoint_config_mut()
-        .cid_generator(|| Box::new(quinn_proto::RandomConnectionIdGenerator::new(0)));
+    // A zero-length source CID cannot distinguish multiple connections sharing
+    // one endpoint. Use a normal CID for every pooled connection so response
+    // packets cannot be dispatched to the wrong connection.
+    let source_cid_size = source_cid_len(conns);
+    config.quic_endpoint_config_mut().cid_generator(move || {
+        Box::new(quinn_proto::RandomConnectionIdGenerator::new(
+            source_cid_size,
+        ))
+    });
     config
         .quic_config_mut()
         .initial_dst_cid_provider(Arc::new(|| {
@@ -793,6 +807,13 @@ pub(crate) async fn url_host_and_port(url: &str) -> Result<(std::net::SocketAddr
 #[cfg(test)]
 mod heartbeat_tests {
     use super::*;
+
+    #[test]
+    fn pooled_connections_use_distinguishable_source_cids() {
+        assert_eq!(source_cid_len(1), 8);
+        assert_eq!(source_cid_len(2), 8);
+        assert_eq!(source_cid_len(8), 8);
+    }
 
     #[test]
     fn heartbeat_jitter_stays_in_band() {
