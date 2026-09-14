@@ -319,6 +319,11 @@ impl Cli {
             self.server_url.is_some() || self.url.is_some(),
             "client needs --server (WebTransport) and/or --url (HTTPS fallback)"
         );
+        anyhow::ensure!(
+            (1..=8).contains(&self.conns),
+            "--conns must be 1..=8, got {}",
+            self.conns
+        );
         warn_open_inbound("--bind", &self.bind, self.inbound_auth.is_some());
         if let Some(hb) = &self.http_bind {
             warn_open_inbound("--http-bind", hb, self.inbound_auth.is_some());
@@ -375,7 +380,7 @@ impl Cli {
                 Some(raw) => Some(parse_inbound_auth(raw)?),
                 None => None,
             },
-            conns: self.conns.clamp(1, 8),
+            conns: self.conns,
             uid,
             password,
             skip_verify: self.skip_verify,
@@ -934,6 +939,19 @@ mod tests {
         let mut args = vec!["newppp", "-c", "--auth", "a:b", "--server", "https://h:443"];
         args.extend_from_slice(extra);
         Cli::try_parse_from(args.iter().map(|s| s.to_string())).unwrap()
+    }
+
+    #[test]
+    fn conns_range_validated() {
+        // Out-of-range pool sizes are rejected, not silently clamped.
+        let e = client_cli(&["--conns", "0"]).client_config().unwrap_err();
+        assert!(format!("{e:#}").contains("--conns"), "{e:#}");
+        assert!(client_cli(&["--conns", "9"]).client_config().is_err());
+        assert_eq!(
+            client_cli(&["--conns", "8"]).client_config().unwrap().conns,
+            8
+        );
+        assert_eq!(client_cli(&[]).client_config().unwrap().conns, 2);
     }
 
     #[test]

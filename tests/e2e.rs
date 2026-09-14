@@ -980,6 +980,24 @@ async fn complete_wt_auth(conn: wtransport::Connection) -> Result<()> {
     Ok(())
 }
 
+/// T-04: a WT session that authenticates at the HTTP level but never opens the
+/// in-band control stream must be dropped within `AUTH_TIMEOUT`, so it cannot
+/// pin an unauthenticated-gate slot until the QUIC idle timeout (30s).
+#[tokio::test]
+async fn wt_without_control_stream_is_dropped() {
+    let srv = spawn_server(false).await.expect("server");
+    let bearer = make_bearer(&derive_static_key(PASS, UID), UID);
+    let conn = raw_wt_connect(&srv.wt_url(), Some(format!("Bearer {bearer}")))
+        .await
+        .expect("valid bearer accepted");
+    // Never call `open_bi()`: the pre-AUTH wait must be bounded by the
+    // server's `AUTH_TIMEOUT` (10s), not the 30s QUIC idle timeout.
+    timeout(Duration::from_secs(15), conn.closed())
+        .await
+        .expect("server must drop a session that never opens the control stream");
+    srv.shutdown().await;
+}
+
 /// 8: TCP half-close — a client FIN must not truncate the session; the
 /// target still finishes and the full response arrives (WT + POST paths).
 #[tokio::test]

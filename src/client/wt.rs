@@ -459,6 +459,26 @@ impl WtConn {
         });
 
         // ---- control stream writer ----
+        Self::spawn_control_writer(ctrl_rx, writer);
+
+        // ---- control stream reader (UDP fallback frames + PONG) ----
+        Self::spawn_control_reader(this.clone(), reader);
+
+        // ---- datagram receive loop ----
+        Self::spawn_datagram_reader(this.clone(), cipher);
+
+        // ---- death watcher + heartbeat (Ping/Pong keepalive) ----
+        Self::spawn_lifecycle(this.clone());
+
+        info!("wt connection established -> {}", cfg.url);
+        Ok(this)
+    }
+
+    /// Drain encoded control frames onto the control stream until it dies.
+    fn spawn_control_writer(
+        ctrl_rx: mpsc::Receiver<OutFrame>,
+        mut writer: FrameWriter<wtransport::SendStream>,
+    ) {
         tokio::spawn(async move {
             let mut ctrl_rx = ctrl_rx;
             while let Some(f) = ctrl_rx.recv().await {
@@ -471,118 +491,110 @@ impl WtConn {
                 }
             }
         });
+    }
 
-        // ---- control stream reader (UDP fallback frames + PONG) ----
-        {
-            let this2 = this.clone();
-            tokio::spawn(async move {
-                while let Ok(Some(f)) = reader.read().await {
-                    this2.dispatch(f).await;
-                }
-                this2.expire("control stream closed").await;
-            });
-        }
+    /// Read control-stream replies (fallback UDP frames + PONG) into dispatch.
+    fn spawn_control_reader(this: Arc<Self>, mut reader: FrameReader<wtransport::RecvStream>) {
+        tokio::spawn(async move {
+            while let Ok(Some(f)) = reader.read().await {
+                this.dispatch(f).await;
+            }
+            this.expire("control stream closed").await;
+        });
+    }
 
-        // ---- datagram receive loop ----
-        {
-            let this2 = this.clone();
-            let cipher2 = cipher.clone();
-            let limit2 = this.limit.clone();
-            tokio::spawn(async move {
-                let mut dec =
-                    FrameDecoder::with_limit(Some(cipher2), Some(ReplayWindow::new()), limit2);
-                while let Ok(d) = this2.conn.receive_datagram().await {
-                    dec.feed(&d);
-                    loop {
-                        match dec.next_frame() {
-                            Ok(Some(f)) => this2.dispatch(f).await,
-                            Ok(None) => break,
-                            // A corrupt datagram must not desync the decoder
-                            // for the rest of the connection: drop the
-                            // buffered bytes (the replay window is kept).
-                            Err(e) => {
-                                debug!("wt datagram: bad frame: {e}");
-                                dec.clear();
-                                break;
-                            }
-                        }
-                    }
-                }
-                this2.expire("datagram channel closed").await;
-            });
-        }
-
-        // ---- death watcher + heartbeat (Ping/Pong keepalive) ----
-        {
-            let this2 = this.clone();
-            tokio::spawn(async move {
-                tokio::select! {
-                    e = this2.conn.closed() => {
-                        let reason = format!("quic closed: {e:?}");
-                        this2.expire(&reason).await;
-                    }
-                    _ = this2.close.cancelled() => {
-                        // Background tasks hold their own Connection clones;
-                        // an explicit close is required for the QUIC
-                        // connection (and those tasks) to actually end.
-                        this2.conn.close(wtransport::VarInt::from_u32(0), b"pool retired");
-                        this2.expire("connection retired").await;
-                    }
-                }
-                this2.close.cancel();
-            });
-            let this3 = this.clone();
-            tokio::spawn(async move {
-                // Fixed-interval heartbeats are a textbook beaconing signal
-                // (a passive observer can pick the connection out of a CDN's
-                // traffic by the 30s periodicity alone). Jitter each period
-                // by ±20% so the cadence carries no exploitable signature.
-                // The jitter must stay well inside the Pong-judge budget:
-                // PONG_MISS_LIMIT=2 with a 36s worst case still gives the
-                // link ~72s before being declared half-dead.
-                let mut iv = tokio::time::interval(heartbeat_interval());
-                iv.tick().await; // skip immediate tick
+    /// Receive QUIC datagrams (the UDP fast path) into dispatch.
+    fn spawn_datagram_reader(this: Arc<Self>, cipher: Arc<FrameCipher>) {
+        let limit = this.limit.clone();
+        tokio::spawn(async move {
+            let mut dec = FrameDecoder::with_limit(Some(cipher), Some(ReplayWindow::new()), limit);
+            while let Ok(d) = this.conn.receive_datagram().await {
+                dec.feed(&d);
                 loop {
-                    tokio::select! {
-                        _ = iv.tick() => {}
-                        _ = this3.close.cancelled() => break,
-                    }
-                    // Pong liveness judge: each tick marks whether the last
-                    // heartbeat got a reply. PONG_MISS_LIMIT consecutive
-                    // misses (default 2) mean the link is half-dead — the
-                    // TCP session layer may still look fine while the QUIC
-                    // path is unreachable. Retire the conn so the pool
-                    // redials instead of stalling in request timeouts.
-                    if this3.pong_seen.swap(false, Ordering::Relaxed) {
-                        this3.missed_pings.store(0, Ordering::Relaxed);
-                    } else {
-                        let missed = this3.missed_pings.fetch_add(1, Ordering::Relaxed) + 1;
-                        if missed >= PONG_MISS_LIMIT {
-                            this3
-                                .expire(&format!(
-                                    "pong timeout: {missed} consecutive pings unanswered"
-                                ))
-                                .await;
+                    match dec.next_frame() {
+                        Ok(Some(f)) => this.dispatch(f).await,
+                        Ok(None) => break,
+                        // A corrupt datagram must not desync the decoder for
+                        // the rest of the connection: drop the buffered bytes
+                        // (the replay window is kept).
+                        Err(e) => {
+                            debug!("wt datagram: bad frame: {e}");
+                            dec.clear();
                             break;
                         }
                     }
-                    if this3
-                        .ctrl_tx
-                        .send(OutFrame::new(FrameType::Ping, 0, 0, Vec::new()))
-                        .await
-                        .is_err()
-                    {
+                }
+            }
+            this.expire("datagram channel closed").await;
+        });
+    }
+
+    /// Death watcher (QUIC closed / pool retire) plus the jittered heartbeat.
+    fn spawn_lifecycle(this: Arc<Self>) {
+        let watcher = this.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                e = watcher.conn.closed() => {
+                    let reason = format!("quic closed: {e:?}");
+                    watcher.expire(&reason).await;
+                }
+                _ = watcher.close.cancelled() => {
+                    // Background tasks hold their own Connection clones;
+                    // an explicit close is required for the QUIC
+                    // connection (and those tasks) to actually end.
+                    watcher.conn.close(wtransport::VarInt::from_u32(0), b"pool retired");
+                    watcher.expire("connection retired").await;
+                }
+            }
+            watcher.close.cancel();
+        });
+
+        tokio::spawn(async move {
+            // Fixed-interval heartbeats are a textbook beaconing signal
+            // (a passive observer can pick the connection out of a CDN's
+            // traffic by the 30s periodicity alone). Jitter each period
+            // by ±20% so the cadence carries no exploitable signature.
+            // The jitter must stay well inside the Pong-judge budget:
+            // PONG_MISS_LIMIT=2 with a 36s worst case still gives the
+            // link ~72s before being declared half-dead.
+            let mut iv = tokio::time::interval(heartbeat_interval());
+            iv.tick().await; // skip immediate tick
+            loop {
+                tokio::select! {
+                    _ = iv.tick() => {}
+                    _ = this.close.cancelled() => break,
+                }
+                // Pong liveness judge: each tick marks whether the last
+                // heartbeat got a reply. PONG_MISS_LIMIT consecutive
+                // misses (default 2) mean the link is half-dead — the
+                // TCP session layer may still look fine while the QUIC
+                // path is unreachable. Retire the conn so the pool
+                // redials instead of stalling in request timeouts.
+                if this.pong_seen.swap(false, Ordering::Relaxed) {
+                    this.missed_pings.store(0, Ordering::Relaxed);
+                } else {
+                    let missed = this.missed_pings.fetch_add(1, Ordering::Relaxed) + 1;
+                    if missed >= PONG_MISS_LIMIT {
+                        this.expire(&format!(
+                            "pong timeout: {missed} consecutive pings unanswered"
+                        ))
+                        .await;
                         break;
                     }
-                    // Re-arm the next period with fresh jitter.
-                    iv = tokio::time::interval(heartbeat_interval());
-                    iv.tick().await; // consume the immediate first tick
                 }
-            });
-        }
-
-        info!("wt connection established -> {}", cfg.url);
-        Ok(this)
+                if this
+                    .ctrl_tx
+                    .send(OutFrame::new(FrameType::Ping, 0, 0, Vec::new()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                // Re-arm the next period with fresh jitter.
+                iv = tokio::time::interval(heartbeat_interval());
+                iv.tick().await; // consume the immediate first tick
+            }
+        });
     }
 
     /// Route inbound control/datagram frames.

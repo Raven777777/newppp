@@ -90,7 +90,13 @@ async fn handle_wt_conn(
     guard: crate::server::limit::UnauthGuard,
 ) -> Result<()> {
     // ---- control stream: first bidi stream carries the AUTH handshake ----
-    let (send, recv) = conn.accept_bi().await?;
+    // Bound the wait for it: a connection that never opens a stream must not
+    // pin an unauthenticated-gate slot until the QUIC idle timeout.
+    let (send, recv) = match timeout(AUTH_TIMEOUT, conn.accept_bi()).await {
+        Ok(Ok(pair)) => pair,
+        // Silent drop: no error signature for probes.
+        _ => return Ok(()),
+    };
     let mut reader = FrameReader::new(recv, None, None);
     reader.decoder_mut().raw = true;
 
@@ -162,18 +168,7 @@ async fn handle_wt_conn(
 
     // ---- control stream writer ----
     let (ctrl_tx, ctrl_rx) = mpsc::channel::<OutFrame>(128);
-    tokio::spawn(async move {
-        let mut ctrl_rx = ctrl_rx;
-        while let Some(f) = ctrl_rx.recv().await {
-            if writer
-                .write(f.ftype, f.flags, f.sid, &f.payload)
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
-    });
+    spawn_ctrl_writer(ctrl_rx, writer);
 
     let sink_dgram = FrameSink::Datagram {
         conn: conn.clone(),
@@ -186,125 +181,26 @@ async fn handle_wt_conn(
     };
 
     // ---- control stream reader: UDP + PING ----
-    {
-        let st2 = st.clone();
-        let cs2 = conn_state.clone();
-        let sink_dgram2 = sink_dgram.clone();
-        let sink_ctrl2 = FrameSink::Chan(ctrl_tx.clone());
-        tokio::spawn(async move {
-            while let Ok(Some(f)) = reader.read().await {
-                match f.ftype {
-                    FrameType::Ping => {
-                        let _ = sink_ctrl2.send(FrameType::Pong, 0, 0, &[]).await;
-                    }
-                    FrameType::UdpAssociate => {
-                        let hooks = Hooks {
-                            st: st2.clone(),
-                            conn: cs2.clone(),
-                            sink: sink_dgram2.clone(),
-                        };
-                        let res = hooks.udp_associate(f.sid, sink_dgram2.clone()).await;
-                        let frame = match res {
-                            Ok(()) => OutFrame::new(FrameType::UdpOk, 0, f.sid, Vec::new()),
-                            Err(e) => {
-                                OutFrame::new(FrameType::OpenErr, 0, f.sid, vec![e.to_code()])
-                            }
-                        };
-                        let _ = sink_ctrl2
-                            .send(frame.ftype, frame.flags, frame.sid, &frame.payload)
-                            .await;
-                    }
-                    FrameType::UdpData => {
-                        let mut r = crate::proto::addr::Reader::new(&f.payload);
-                        if let Ok(dst) = crate::proto::addr::UdpAddr::decode(&mut r) {
-                            cs2.touch(f.sid);
-                            let hooks = Hooks {
-                                st: st2.clone(),
-                                conn: cs2.clone(),
-                                sink: sink_dgram2.clone(),
-                            };
-                            hooks.udp_feed(f.sid, dst, r.rest().to_vec()).await;
-                        }
-                    }
-                    FrameType::Close | FrameType::Error
-                        // Release only when this call actually removed the
-                        // registered handle (parity with hub.rs close_tcp);
-                        // duplicate frames must not corrupt the global quota.
-                        if cs2.drop_session(f.sid) =>
-                    {
-                        st2.release_session();
-                    }
-                    _ => {}
-                }
-            }
-            cs2.cancel.cancel();
-        });
-    }
+    spawn_ctrl_reader(
+        st.clone(),
+        conn_state.clone(),
+        sink_dgram.clone(),
+        ctrl_tx.clone(),
+        reader,
+    );
 
     // ---- datagram receive loop ----
-    {
-        let st2 = st.clone();
-        let cs2 = conn_state.clone();
-        let sink_dgram2 = sink_dgram.clone();
-        let cipher2 = cipher.clone();
-        let conn2 = conn.clone();
-        let limit2 = limit.clone();
-        tokio::spawn(async move {
-            let mut dec =
-                FrameDecoder::with_limit(Some(cipher2), Some(ReplayWindow::new()), limit2);
-            while let Ok(d) = conn2.receive_datagram().await {
-                dec.feed(&d);
-                loop {
-                    match dec.next_frame() {
-                        Ok(Some(f)) => {
-                            if f.ftype != FrameType::UdpData {
-                                continue;
-                            }
-                            let mut r = crate::proto::addr::Reader::new(&f.payload);
-                            if let Ok(dst) = crate::proto::addr::UdpAddr::decode(&mut r) {
-                                cs2.touch(f.sid);
-                                let hooks = Hooks {
-                                    st: st2.clone(),
-                                    conn: cs2.clone(),
-                                    sink: sink_dgram2.clone(),
-                                };
-                                hooks.udp_feed(f.sid, dst, r.rest().to_vec()).await;
-                            }
-                        }
-                        Ok(None) => break,
-                        // A corrupt datagram must not desync the decoder for
-                        // the rest of the connection: drop the buffered bytes
-                        // (the replay window itself is kept) and carry on.
-                        Err(e) => {
-                            debug!("wt datagram: bad frame: {e}");
-                            dec.clear();
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-    }
+    spawn_dgram_reader(
+        st.clone(),
+        conn_state.clone(),
+        sink_dgram.clone(),
+        cipher.clone(),
+        conn.clone(),
+        limit.clone(),
+    );
 
     // ---- connection death watcher ----
-    {
-        let cs2 = conn_state.clone();
-        let st2 = st.clone();
-        let conn3 = conn.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = conn3.closed() => {}
-                _ = cs2.cancel.cancelled() => {
-                    // Reaper-initiated teardown: cancel alone doesn't end the
-                    // QUIC transport (background tasks hold their own clones),
-                    // so close it explicitly.
-                    conn3.close(wtransport::VarInt::from_u32(0), b"idle conn reaped");
-                }
-            }
-            cs2.cancel.cancel();
-            st2.conns.remove(&cs2.id);
-        });
-    }
+    spawn_death_watcher(st.clone(), conn_state.clone(), conn.clone());
 
     // ---- dedicated TCP sessions: one bidi stream each ----
     loop {
@@ -323,4 +219,143 @@ async fn handle_wt_conn(
         }
     }
     Ok(())
+}
+
+/// Drain encoded control frames onto the WT control stream until it dies.
+fn spawn_ctrl_writer(
+    ctrl_rx: mpsc::Receiver<OutFrame>,
+    mut writer: FrameWriter<wtransport::SendStream>,
+) {
+    tokio::spawn(async move {
+        let mut ctrl_rx = ctrl_rx;
+        while let Some(f) = ctrl_rx.recv().await {
+            if writer
+                .write(f.ftype, f.flags, f.sid, &f.payload)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+}
+
+/// Handle control-stream frames: UDP ASSOCIATE/DATA plus keepalive PING, and
+/// release the session quota on Close/Error.
+fn spawn_ctrl_reader(
+    st: Arc<ServerState>,
+    cs: Arc<ConnState>,
+    sink_dgram: FrameSink,
+    ctrl_tx: mpsc::Sender<OutFrame>,
+    mut reader: FrameReader<wtransport::RecvStream>,
+) {
+    let sink_ctrl = FrameSink::Chan(ctrl_tx);
+    tokio::spawn(async move {
+        while let Ok(Some(f)) = reader.read().await {
+            match f.ftype {
+                FrameType::Ping => {
+                    let _ = sink_ctrl.send(FrameType::Pong, 0, 0, &[]).await;
+                }
+                FrameType::UdpAssociate => {
+                    let hooks = Hooks {
+                        st: st.clone(),
+                        conn: cs.clone(),
+                        sink: sink_dgram.clone(),
+                    };
+                    let res = hooks.udp_associate(f.sid, sink_dgram.clone()).await;
+                    let frame = match res {
+                        Ok(()) => OutFrame::new(FrameType::UdpOk, 0, f.sid, Vec::new()),
+                        Err(e) => OutFrame::new(FrameType::OpenErr, 0, f.sid, vec![e.to_code()]),
+                    };
+                    let _ = sink_ctrl
+                        .send(frame.ftype, frame.flags, frame.sid, &frame.payload)
+                        .await;
+                }
+                FrameType::UdpData => {
+                    let mut r = crate::proto::addr::Reader::new(&f.payload);
+                    if let Ok(dst) = crate::proto::addr::UdpAddr::decode(&mut r) {
+                        cs.touch(f.sid);
+                        let hooks = Hooks {
+                            st: st.clone(),
+                            conn: cs.clone(),
+                            sink: sink_dgram.clone(),
+                        };
+                        hooks.udp_feed(f.sid, dst, r.rest().to_vec()).await;
+                    }
+                }
+                FrameType::Close | FrameType::Error
+                    // Release only when this call actually removed the
+                    // registered handle (parity with hub.rs close_tcp);
+                    // duplicate frames must not corrupt the global quota.
+                    if cs.drop_session(f.sid) =>
+                {
+                    st.release_session();
+                }
+                _ => {}
+            }
+        }
+        cs.cancel.cancel();
+    });
+}
+
+/// Receive QUIC datagrams (the UDP fast path) into the UDP hooks.
+fn spawn_dgram_reader(
+    st: Arc<ServerState>,
+    cs: Arc<ConnState>,
+    sink_dgram: FrameSink,
+    cipher: Arc<FrameCipher>,
+    conn: wtransport::Connection,
+    limit: FrameLimit,
+) {
+    tokio::spawn(async move {
+        let mut dec = FrameDecoder::with_limit(Some(cipher), Some(ReplayWindow::new()), limit);
+        while let Ok(d) = conn.receive_datagram().await {
+            dec.feed(&d);
+            loop {
+                match dec.next_frame() {
+                    Ok(Some(f)) => {
+                        if f.ftype != FrameType::UdpData {
+                            continue;
+                        }
+                        let mut r = crate::proto::addr::Reader::new(&f.payload);
+                        if let Ok(dst) = crate::proto::addr::UdpAddr::decode(&mut r) {
+                            cs.touch(f.sid);
+                            let hooks = Hooks {
+                                st: st.clone(),
+                                conn: cs.clone(),
+                                sink: sink_dgram.clone(),
+                            };
+                            hooks.udp_feed(f.sid, dst, r.rest().to_vec()).await;
+                        }
+                    }
+                    Ok(None) => break,
+                    // A corrupt datagram must not desync the decoder for the
+                    // rest of the connection: drop the buffered bytes (the
+                    // replay window itself is kept) and carry on.
+                    Err(e) => {
+                        debug!("wt datagram: bad frame: {e}");
+                        dec.clear();
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Watch for connection death (or reaper cancellation) and remove the state.
+fn spawn_death_watcher(st: Arc<ServerState>, cs: Arc<ConnState>, conn: wtransport::Connection) {
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = conn.closed() => {}
+            _ = cs.cancel.cancelled() => {
+                // Reaper-initiated teardown: cancel alone doesn't end the
+                // QUIC transport (background tasks hold their own clones),
+                // so close it explicitly.
+                conn.close(wtransport::VarInt::from_u32(0), b"idle conn reaped");
+            }
+        }
+        cs.cancel.cancel();
+        st.conns.remove(&cs.id);
+    });
 }

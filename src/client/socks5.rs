@@ -80,11 +80,25 @@ async fn handle(mut sock: TcpStream, ob: Outbound, auth: Option<(String, String)
 
     match cmd {
         1 => connect_cmd(sock, ob, target).await,
-        3 => udp_cmd(sock, ob).await,
+        3 => udp_cmd(sock, ob, target).await,
         _ => {
             reply(&mut sock, 7).await.ok();
             anyhow::bail!("unsupported cmd {cmd}");
         }
+    }
+}
+
+/// Source IP a UDP association accepts datagrams from. RFC 1928: the
+/// ASSOCIATE request's DST.ADDR is the address the client expects to send
+/// from, so a concrete address there takes precedence; an unspecified address
+/// (`0.0.0.0` / `::`), a domain or a missing value falls back to the TCP
+/// peer's IP. Datagrams from any other source are dropped, so a host that
+/// merely reaches the relay port cannot hijack the association with a first
+/// packet.
+fn udp_client_ip(requested: &str, peer: std::net::IpAddr) -> std::net::IpAddr {
+    match requested.parse::<std::net::IpAddr>() {
+        Ok(ip) if !ip.is_unspecified() => ip,
+        _ => peer,
     }
 }
 
@@ -154,17 +168,31 @@ async fn connect_cmd(mut sock: TcpStream, ob: Outbound, target: (String, u16)) -
     }
 }
 
-async fn udp_cmd(mut sock: TcpStream, ob: Outbound) -> Result<()> {
+async fn udp_cmd(mut sock: TcpStream, ob: Outbound, target: (String, u16)) -> Result<()> {
     use std::sync::Mutex as StdMutex;
 
-    // bind relay on the same family as the control connection
+    // Only datagrams from the association's client are accepted: the address
+    // the client declared in the ASSOCIATE request, else the TCP peer's IP.
+    let expected_ip = udp_client_ip(&target.0, sock.peer_addr()?.ip());
+
+    // Bind the relay to the exact local address the control connection was
+    // accepted on, instead of the wildcard. The address advertised to the
+    // client below (BND.ADDR) is already `local.ip()`; a wildcard bind also
+    // listens on every *other* interface, where a host that is not the SOCKS
+    // client could send the first datagram and hijack the relay (the client
+    // endpoint is learned from the first packet). The IPv6 scope id is kept
+    // so link-local control connections still bind correctly.
     let local = sock.local_addr()?;
-    let relay = if local.is_ipv4() {
-        UdpSocket::bind("0.0.0.0:0").await?
-    } else {
-        UdpSocket::bind("[::]:0").await?
+    let relay_bind = match local {
+        std::net::SocketAddr::V4(v4) => {
+            std::net::SocketAddr::new(std::net::IpAddr::V4(*v4.ip()), 0)
+        }
+        std::net::SocketAddr::V6(mut v6) => {
+            v6.set_port(0);
+            std::net::SocketAddr::V6(v6)
+        }
     };
-    let relay = Arc::new(relay);
+    let relay = Arc::new(UdpSocket::bind(relay_bind).await?);
     let relay_port = relay.local_addr()?.port();
 
     let mut pipe = match ob.udp_associate().await {
@@ -218,6 +246,13 @@ async fn udp_cmd(mut sock: TcpStream, ob: Outbound) -> Result<()> {
                     r = relay.recv_from(&mut buf) => {
                         match r {
                             Ok((n, from)) => {
+                                if from.ip() != expected_ip {
+                                    debug!(
+                                        "socks5 udp: dropping datagram from {from} \
+                                         (expected source ip {expected_ip})"
+                                    );
+                                    continue;
+                                }
                                 {
                                     // poisoning can only carry a panic that
                                     // occurred outside the lock scope; the
@@ -264,4 +299,32 @@ async fn udp_cmd(mut sock: TcpStream, ob: Outbound) -> Result<()> {
     }
     debug!("socks5 udp relay closed");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::IpAddr;
+
+    /// The admission source: a concrete address in the ASSOCIATE request wins;
+    /// unspecified/domain/missing falls back to the TCP peer's IP, so a relay
+    /// cannot be hijacked by an unrelated sender.
+    #[test]
+    fn udp_client_ip_prefers_concrete_request_address() {
+        let peer: IpAddr = "203.0.113.5".parse().unwrap();
+        assert_eq!(udp_client_ip("0.0.0.0", peer), peer);
+        assert_eq!(udp_client_ip("::", peer), peer);
+        assert_eq!(udp_client_ip("", peer), peer);
+        assert_eq!(udp_client_ip("example.com", peer), peer);
+        assert_eq!(
+            udp_client_ip("198.51.100.7", peer),
+            "198.51.100.7".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            udp_client_ip("2001:db8::1", peer),
+            "2001:db8::1".parse::<IpAddr>().unwrap()
+        );
+        // An unspecified leaf inside a scoped v6 form still falls back.
+        assert_eq!(udp_client_ip("::0", peer), peer);
+    }
 }

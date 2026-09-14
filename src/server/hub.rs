@@ -197,6 +197,13 @@ pub fn is_public_target(addr: std::net::SocketAddr) -> bool {
                 && !(segments[0] & 0xffc0 == 0xfe80)
                 // 2001:db8::/32 — documentation-only, never routable
                 && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
+                // 2001::/32 — Teredo (tunnels to an embedded IPv4)
+                && !(segments[0] == 0x2001 && segments[1] == 0x0000)
+                // 2001:10::/28 (ORCHID) and 2001:20::/28 (ORCHIDv2)
+                && !(segments[0] == 0x2001
+                    && matches!(segments[1] & 0xfff0, 0x0010 | 0x0020))
+                // 100::/64 — discard-only address block
+                && !(segments[..4] == [0x0100, 0, 0, 0])
         }
     }
 }
@@ -601,96 +608,118 @@ pub async fn handle_wt_stream(
     }
     debug!("wt stream session sid={sid} -> {host}:{port}");
 
-    let (mut sock_rd, mut sock_wr) = tokio::io::split(sock);
+    let (sock_rd, sock_wr) = tokio::io::split(sock);
 
     // target -> client (owns the frame writer; owns the teardown/release)
-    {
-        let st2 = st.clone();
-        let conn2 = conn.clone();
-        let token2 = token.clone();
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; READ_BUF];
-            loop {
-                tokio::select! {
-                    _ = token2.cancelled() => break,
-                    r = sock_rd.read(&mut buf) => {
-                        match r {
-                            Ok(0) => {
-                                let _ = writer.write(FrameType::Data, FLAG_FIN, sid, &[]).await;
-                                break;
-                            }
-                            Ok(n) => {
-                                conn2.touch(sid);
-                                conn2.rate.acquire(n).await;
-                                if writer.write(FrameType::Data, 0, sid, &buf[..n]).await.is_err() {
-                                    break;
-                                }
-                            }
-                            Err(_) => {
-                                let _ = writer.write(FrameType::Close, FLAG_RST, sid, &[]).await;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            let _ = writer.shutdown().await;
-            if conn2.drop_session(sid) {
-                st2.release_session();
-            }
-        });
-    }
+    spawn_wt_target_to_client(
+        st.clone(),
+        conn.clone(),
+        token.clone(),
+        sid,
+        writer,
+        sock_rd,
+    );
 
     // client -> target (owns the frame reader)
-    //
-    // A client FIN (FLAG_FIN Data / Close+FIN / stream EOF) is a half-close:
-    // shut the write half down but keep the session alive so the
-    // target -> client pump can finish the response. Only aborts (RST,
-    // protocol error, connection teardown) drop the session here.
-    {
-        let st2 = st.clone();
-        let conn2 = conn.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = token.cancelled() => break,
-                    r = reader.read() => {
-                        match r {
-                            Ok(Some(f)) => match f.ftype {
-                                FrameType::Data => {
-                                    conn2.touch(sid);
-                                    conn2.rate.acquire(f.payload.len()).await;
-                                    if sock_wr.write_all(&f.payload).await.is_err() {
-                                        break;
-                                    }
-                                    if f.flags & FLAG_FIN != 0 {
-                                        let _ = sock_wr.shutdown().await;
-                                        return; // half-close: defer teardown
-                                    }
-                                }
-                                FrameType::Close => {
-                                    if f.flags & FLAG_FIN != 0 {
-                                        let _ = sock_wr.shutdown().await;
-                                        return; // half-close: defer teardown
-                                    }
-                                    break; // RST: abort the session
-                                }
-                                _ => {}
-                            },
-                            Ok(None) => {
-                                let _ = sock_wr.shutdown().await;
-                                return; // client stream EOF: half-close
+    spawn_wt_client_to_target(st.clone(), conn.clone(), token, sid, reader, sock_wr);
+}
+
+/// target -> client pump: reads the target socket and writes DATA/FIN/RST
+/// frames. Owns the frame writer and the session teardown/quota release.
+fn spawn_wt_target_to_client(
+    st: Arc<ServerState>,
+    conn: Arc<ConnState>,
+    token: CancellationToken,
+    sid: u32,
+    mut writer: FrameWriter<wtransport::SendStream>,
+    mut sock_rd: tokio::io::ReadHalf<TcpStream>,
+) {
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; READ_BUF];
+        loop {
+            tokio::select! {
+                _ = token.cancelled() => break,
+                r = sock_rd.read(&mut buf) => {
+                    match r {
+                        Ok(0) => {
+                            let _ = writer.write(FrameType::Data, FLAG_FIN, sid, &[]).await;
+                            break;
+                        }
+                        Ok(n) => {
+                            conn.touch(sid);
+                            conn.rate.acquire(n).await;
+                            if writer.write(FrameType::Data, 0, sid, &buf[..n]).await.is_err() {
+                                break;
                             }
-                            Err(_) => break,
+                        }
+                        Err(_) => {
+                            let _ = writer.write(FrameType::Close, FLAG_RST, sid, &[]).await;
+                            break;
                         }
                     }
                 }
             }
-            if conn2.drop_session(sid) {
-                st2.release_session();
+        }
+        let _ = writer.shutdown().await;
+        if conn.drop_session(sid) {
+            st.release_session();
+        }
+    });
+}
+
+/// client -> target pump: reads DATA/Close frames and writes the target
+/// socket. A client FIN (FLAG_FIN Data / Close+FIN / stream EOF) is a
+/// half-close: it shuts the write half down but keeps the session alive so the
+/// target -> client pump can finish the response. Only aborts (RST, protocol
+/// error, connection teardown) drop the session here.
+fn spawn_wt_client_to_target(
+    st: Arc<ServerState>,
+    conn: Arc<ConnState>,
+    token: CancellationToken,
+    sid: u32,
+    mut reader: FrameReader<wtransport::RecvStream>,
+    mut sock_wr: tokio::io::WriteHalf<TcpStream>,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = token.cancelled() => break,
+                r = reader.read() => {
+                    match r {
+                        Ok(Some(f)) => match f.ftype {
+                            FrameType::Data => {
+                                conn.touch(sid);
+                                conn.rate.acquire(f.payload.len()).await;
+                                if sock_wr.write_all(&f.payload).await.is_err() {
+                                    break;
+                                }
+                                if f.flags & FLAG_FIN != 0 {
+                                    let _ = sock_wr.shutdown().await;
+                                    return; // half-close: defer teardown
+                                }
+                            }
+                            FrameType::Close => {
+                                if f.flags & FLAG_FIN != 0 {
+                                    let _ = sock_wr.shutdown().await;
+                                    return; // half-close: defer teardown
+                                }
+                                break; // RST: abort the session
+                            }
+                            _ => {}
+                        },
+                        Ok(None) => {
+                            let _ = sock_wr.shutdown().await;
+                            return; // client stream EOF: half-close
+                        }
+                        Err(_) => break,
+                    }
+                }
             }
-        });
-    }
+        }
+        if conn.drop_session(sid) {
+            st.release_session();
+        }
+    });
 }
 
 #[cfg(test)]
@@ -858,5 +887,32 @@ mod tests {
         assert!(is_public_target(
             "[2606:4700:4700::1111]:443".parse().unwrap()
         ));
+    }
+
+    /// Special-purpose IPv6 blocks must be rejected: Teredo (`2001::/32`,
+    /// tunnels to an embedded IPv4), ORCHID/ORCHIDv2 (`2001:10::/28`,
+    /// `2001:20::/28`) and the discard-only block (`100::/64`). Neighbouring
+    /// global addresses stay allowed.
+    #[test]
+    fn public_target_policy_rejects_ipv6_special_blocks() {
+        for target in [
+            "[2001::1]:80",
+            "[2001:0:5ef5:79fb::1]:80",
+            "[2001:10::1]:80",
+            "[2001:1f::1]:80",
+            "[2001:20::1]:80",
+            "[2001:2f::1]:80",
+            "[100::1]:80",
+            "[100:0:0:0:1234::1]:80",
+        ] {
+            assert!(!is_public_target(target.parse().unwrap()), "{target}");
+        }
+        for target in [
+            "[2606:4700:4700::1111]:443",
+            "[2001:4860:4860::8888]:443",
+            "[2a00:1450:4001:810::200e]:443",
+        ] {
+            assert!(is_public_target(target.parse().unwrap()), "{target}");
+        }
     }
 }

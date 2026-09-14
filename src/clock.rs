@@ -206,9 +206,17 @@ fn parse_http_date(s: &str) -> Option<i64> {
     if t.len() < 6 || !t[0].ends_with(',') {
         return None;
     }
+    // Every component is bounded before the arithmetic below: the date header
+    // is remote input (`--time` may point at a plaintext endpoint), and an
+    // absurd year would make `era * 146_097` overflow `i64` (debug: panic in
+    // the sync task; release: a wrapping, bogus offset). Out-of-range values
+    // are rejected as a bad Date instead.
     let day: i64 = t[1].parse().ok()?;
     let month = MONTHS.iter().find(|(m, _)| *m == t[2])?.1;
     let year: i64 = t[3].parse().ok()?;
+    if !(1..=9999).contains(&year) || !(1..=31).contains(&day) {
+        return None;
+    }
     let hms: Vec<&str> = t[4].split(':').collect();
     if hms.len() != 3 {
         return None;
@@ -218,6 +226,9 @@ fn parse_http_date(s: &str) -> Option<i64> {
         hms[1].parse().ok()?,
         hms[2].parse().ok()?,
     );
+    if !(0..=23).contains(&h) || !(0..=59).contains(&mi) || !(0..=60).contains(&sec) {
+        return None;
+    }
 
     // Days from civil epoch (Howard Hinnant's algorithm), UTC.
     let y = if month <= 2 { year - 1 } else { year };
@@ -301,6 +312,24 @@ mod tests {
             Some(1_789_185_072)
         );
         assert_eq!(parse_http_date("garbage"), None);
+    }
+
+    /// A hostile/misconfigured time endpoint must not be able to overflow the
+    /// civil-date arithmetic: an unbounded year (`i64::MAX`) previously made
+    /// `era * 146_097` overflow `i64`. All out-of-range fields parse to `None`.
+    #[test]
+    fn parse_http_date_rejects_out_of_range_components() {
+        assert_eq!(
+            parse_http_date("Thu, 01 Jan 9223372036854775807 00:00:00 GMT"),
+            None
+        );
+        assert_eq!(parse_http_date("Thu, 01 Jan 0 00:00:00 GMT"), None);
+        assert_eq!(parse_http_date("Thu, 00 Jan 2026 00:00:00 GMT"), None);
+        assert_eq!(parse_http_date("Thu, 32 Jan 2026 00:00:00 GMT"), None);
+        assert_eq!(parse_http_date("Thu, 01 Jan 2026 24:00:00 GMT"), None);
+        assert_eq!(parse_http_date("Thu, 01 Jan 2026 00:60:00 GMT"), None);
+        // A one-off leap second (sec == 60) stays accepted.
+        assert!(parse_http_date("Sat, 31 Dec 2016 23:59:60 GMT").is_some());
     }
 
     #[test]
