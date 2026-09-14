@@ -42,6 +42,13 @@ impl UdpAddr {
                 put(out, a.port());
             }
             UdpAddr::Domain(h, p) => {
+                // One-byte length field: assert the invariant instead of
+                // silently truncating (mirrors the decoder's u8 read).
+                debug_assert!(
+                    h.len() <= u8::MAX as usize,
+                    "domain length {} exceeds the u8 wire field",
+                    h.len()
+                );
                 out.push(3);
                 out.push(h.len() as u8);
                 out.extend_from_slice(h.as_bytes());

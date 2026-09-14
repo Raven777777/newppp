@@ -24,8 +24,8 @@ use crate::proto::crypto::{
     SALT_LEN,
 };
 use crate::proto::frame::{
-    encode_open, random_padding, FrameDecoder, FrameEncoder, FrameReader, FrameType, FrameWriter,
-    FLAG_FIN, MAX_PLAINTEXT,
+    encode_open, negotiate, random_padding, FrameDecoder, FrameEncoder, FrameLimit, FrameReader,
+    FrameType, FrameWriter, FLAG_FIN, MAX_PLAINTEXT,
 };
 use crate::proto::mux::{
     next_rand_u32, BoxStream, OpenError, OutFrame, UdpPipe, HANDSHAKE_TIMEOUT, SESSION_BUF,
@@ -40,6 +40,8 @@ pub(crate) struct PoolCfg {
     static_key: [u8; 32],
     uid: String,
     size: usize,
+    /// Advertised plaintext frame limit (bytes), negotiated at AUTH time.
+    max_plaintext: usize,
 }
 
 /// Build the WT pool from the client config. `--sni` masquerade rewires the
@@ -77,6 +79,7 @@ pub async fn new_pool(cfg: &ClientConfig, url: &str) -> Result<WtPool> {
             static_key,
             uid: cfg.uid.clone(),
             size: cfg.conns,
+            max_plaintext: cfg.max_plaintext,
         }),
         endpoint,
         conns: Mutex::new(Vec::new()),
@@ -107,6 +110,9 @@ pub struct WtConn {
     udp: DashMap<u32, mpsc::Sender<(UdpAddr, Vec<u8>)>>,
     pending_udp: DashMap<u32, oneshot::Sender<Result<(), OpenError>>>,
     close: CancellationToken,
+    /// Negotiated plaintext frame limit, shared by every encoder/decoder of
+    /// this connection (control stream, session streams, datagrams).
+    limit: FrameLimit,
 }
 
 const PONG_MISS_LIMIT: usize = 2;
@@ -338,7 +344,7 @@ fn build_tls_config_inner(
 }
 
 /// Random 32 bytes for the GREASE ECH placeholder public key.
-fn rand_bytes_32() -> Vec<u8> {
+pub(crate) fn rand_bytes_32() -> Vec<u8> {
     use rand::RngCore;
     let mut k = vec![0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut k);
@@ -385,13 +391,18 @@ impl WtConn {
             nonce,
             uid: cfg.uid.clone(),
             mac,
+            max_plaintext: cfg.max_plaintext as u32,
         };
         let session_key = derive_session_key(&cfg.static_key, &salt);
         let cipher = Arc::new(FrameCipher::new(&session_key));
 
+        // One negotiated limit for the whole connection; the server's AuthOk
+        // carries the agreed value (the AUTH frame itself is small).
+        let limit = FrameLimit::new(cfg.max_plaintext);
         let counters = CounterGen::stream();
         let static_cipher = Arc::new(FrameCipher::new(&cfg.static_key));
-        let mut writer = FrameWriter::new(send, static_cipher, counters.clone());
+        let mut writer =
+            FrameWriter::with_limit(send, static_cipher, counters.clone(), limit.clone());
         // Handshake payload + random tail: the AUTH ciphertext length stops
         // being a fixed protocol signature (server decodes by field prefix).
         let mut auth_payload = auth.encode();
@@ -402,19 +413,33 @@ impl WtConn {
             .context("send auth")?;
         writer.set_cipher(cipher.clone());
 
-        let mut reader = FrameReader::new(recv, Some(cipher.clone()), None);
+        let mut reader = FrameReader::with_limit(recv, Some(cipher.clone()), None, limit.clone());
         let reply = timeout(HANDSHAKE_TIMEOUT, reader.read())
             .await
             .map_err(|_| anyhow!("auth reply timeout"))??;
         match reply {
-            Some(f) if f.ftype == FrameType::AuthOk => {}
+            Some(f) if f.ftype == FrameType::AuthOk => {
+                // Adopt the server's negotiated value, clamped to what we
+                // advertised and the protocol bounds (defends against a
+                // malicious peer echoing an oversized limit).
+                let n = f
+                    .payload
+                    .get(..4)
+                    .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .ok_or_else(|| anyhow!("short auth reply"))?;
+                limit.set(negotiate(n, cfg.max_plaintext as u32));
+            }
             _ => return Err(anyhow!("server rejected authentication")),
         }
         debug!("wt conn authenticated uid={}", cfg.uid);
 
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<OutFrame>(128);
         let dgram_counters = CounterGen::datagram();
-        let dgram_enc = Arc::new(FrameEncoder::new(cipher.clone(), dgram_counters.clone()));
+        let dgram_enc = Arc::new(FrameEncoder::with_limit(
+            cipher.clone(),
+            dgram_counters.clone(),
+            limit.clone(),
+        ));
 
         let this = Arc::new(WtConn {
             conn: conn.clone(),
@@ -430,6 +455,7 @@ impl WtConn {
             udp: DashMap::new(),
             pending_udp: DashMap::new(),
             close: CancellationToken::new(),
+            limit,
         });
 
         // ---- control stream writer ----
@@ -461,8 +487,10 @@ impl WtConn {
         {
             let this2 = this.clone();
             let cipher2 = cipher.clone();
+            let limit2 = this.limit.clone();
             tokio::spawn(async move {
-                let mut dec = FrameDecoder::new(Some(cipher2), Some(ReplayWindow::new()));
+                let mut dec =
+                    FrameDecoder::with_limit(Some(cipher2), Some(ReplayWindow::new()), limit2);
                 while let Ok(d) = this2.conn.receive_datagram().await {
                     dec.feed(&d);
                     loop {
@@ -633,8 +661,14 @@ impl WtConn {
             .await
             .map_err(|_| anyhow!("stream open timeout"))??;
 
-        let mut writer = FrameWriter::new(send, self.cipher.clone(), self.counters.clone());
-        let mut reader = FrameReader::new(recv, Some(self.cipher.clone()), None);
+        let mut writer = FrameWriter::with_limit(
+            send,
+            self.cipher.clone(),
+            self.counters.clone(),
+            self.limit.clone(),
+        );
+        let mut reader =
+            FrameReader::with_limit(recv, Some(self.cipher.clone()), None, self.limit.clone());
 
         // Open payload + random tail (server decodes by field prefix).
         let mut open_payload = encode_open(host, port);
@@ -748,7 +782,13 @@ impl WtConn {
                     // datagram first, frame fallback when it does not fit
                     let wire = match enc.encode(FrameType::UdpData, 0, sid, &payload) {
                         Ok(w) => w,
-                        Err(_) => break,
+                        Err(e) => {
+                            // Oversized for the frame protocol: drop this
+                            // datagram (UDP is lossy by contract) instead of
+                            // tearing down the whole associate route.
+                            debug!("wt udp: dropping {}-byte datagram: {e}", payload.len());
+                            continue;
+                        }
                     };
                     let max = conn.max_datagram_size().unwrap_or(0);
                     if wire.len() <= max && conn.send_datagram(wire).is_ok() {

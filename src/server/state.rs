@@ -10,12 +10,17 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::proto::crypto::{CounterGen, FrameCipher, AUTH_WINDOW};
+use crate::proto::frame::FrameLimit;
 use crate::server::limit::{RateLimiter, UnauthGate};
 
 /// Upper bound for the replay-nonce cache; expired entries are purged when
 /// it is exceeded (instead of clearing the whole table, which would open a
 /// replay window for captured auth frames).
 const NONCE_CAP: usize = 50_000;
+
+/// Upper bound for the UDP target DNS cache (attacker-chosen names must not
+/// grow it without limit).
+const UDP_DNS_CACHE_CAP: usize = 4096;
 
 /// Per-connection session handle (registered for reaping).
 pub struct SessionHandle {
@@ -74,6 +79,9 @@ pub struct ConnState {
     /// that keepalive Pings deliberately do NOT count: idle connections
     /// with no sessions are reaped by the reaper regardless.
     pub last_active: AtomicI64,
+    /// Negotiated plaintext frame limit, shared by every encoder/decoder of
+    /// this connection (control stream, session streams, datagrams).
+    pub limit: FrameLimit,
 }
 
 impl ConnState {
@@ -187,6 +195,12 @@ pub struct ServerState {
     pub seen_nonces: DashMap<String, u64>,
     pub(crate) nonce_lock: std::sync::Mutex<()>,
     pub path: String,
+    /// Advertised plaintext frame limit (bytes) for new sessions.
+    pub max_plaintext: usize,
+    /// UDP target DNS cache: "host:port" (lowercased) -> address + insert time.
+    pub udp_dns: DashMap<String, (std::net::SocketAddr, Instant)>,
+    /// TTL of [`ServerState::udp_dns`] entries (zero disables caching).
+    pub udp_dns_ttl: Duration,
 }
 
 impl ServerState {
@@ -197,6 +211,38 @@ impl ServerState {
             .entry(uid.to_owned())
             .or_insert_with(|| Arc::new(RateLimiter::new(self.rate_mbps)))
             .clone()
+    }
+
+    /// Cached UDP target resolution for `key` (see [`ServerState::udp_dns_store`]).
+    pub fn udp_dns_cached(&self, key: &str, now: Instant) -> Option<std::net::SocketAddr> {
+        if self.udp_dns_ttl.is_zero() {
+            return None;
+        }
+        let entry = self.udp_dns.get(key)?;
+        let (addr, at) = *entry;
+        if now.duration_since(at) <= self.udp_dns_ttl {
+            Some(addr)
+        } else {
+            None
+        }
+    }
+
+    /// Cache a resolved UDP target. Expired entries are purged when the table
+    /// is full; a still-full table simply skips caching (the datagram is still
+    /// sent with the freshly resolved address).
+    pub fn udp_dns_store(&self, key: String, addr: std::net::SocketAddr, now: Instant) {
+        if self.udp_dns_ttl.is_zero() {
+            return;
+        }
+        if self.udp_dns.len() >= UDP_DNS_CACHE_CAP {
+            let ttl = self.udp_dns_ttl;
+            self.udp_dns
+                .retain(|_, (_, at)| now.duration_since(*at) <= ttl);
+            if self.udp_dns.len() >= UDP_DNS_CACHE_CAP {
+                return;
+            }
+        }
+        self.udp_dns.insert(key, (addr, now));
     }
 
     pub fn try_acquire_session(&self) -> bool {
@@ -313,6 +359,9 @@ mod tests {
             nonce_lock: std::sync::Mutex::new(()),
             path: "/api/ppp".into(),
             rates: DashMap::new(),
+            max_plaintext: crate::proto::frame::MAX_PLAINTEXT,
+            udp_dns: DashMap::new(),
+            udp_dns_ttl: Duration::from_secs(3600),
         }
     }
 
@@ -329,6 +378,7 @@ mod tests {
             udp_routes: Default::default(),
             max_per_conn: 8,
             last_active: AtomicI64::new(now_millis()),
+            limit: FrameLimit::new(crate::proto::frame::MAX_PLAINTEXT),
         })
     }
 
@@ -442,5 +492,22 @@ mod tests {
         assert!(Arc::ptr_eq(&a1, &a2));
         assert!(!Arc::ptr_eq(&a1, &b));
         assert_eq!(st.rates.len(), 2);
+    }
+
+    #[test]
+    fn udp_dns_cache_respects_ttl_and_disable() {
+        let mut st = test_state();
+        let key = "dns.google:53".to_string();
+        let addr: std::net::SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let now = Instant::now();
+        st.udp_dns_store(key.clone(), addr, now);
+        assert_eq!(st.udp_dns_cached(&key, now), Some(addr));
+        // Past the TTL the entry is stale.
+        let later = now + st.udp_dns_ttl + Duration::from_secs(1);
+        assert_eq!(st.udp_dns_cached(&key, later), None);
+        // TTL 0 disables caching entirely.
+        st.udp_dns_ttl = Duration::ZERO;
+        st.udp_dns_store(key.clone(), addr, now);
+        assert_eq!(st.udp_dns_cached(&key, now), None);
     }
 }

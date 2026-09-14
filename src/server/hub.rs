@@ -2,7 +2,7 @@
 //! transports (dedicated WebTransport streams + mode-A mux).
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -76,9 +76,13 @@ async fn resolve_target(
     }
 }
 
+/// Resolve a UDP datagram target, applying the egress policy. Domain targets
+/// go through the server-wide DNS cache (TTL `--udp-dns-ttl`, default 1h) so a
+/// stream of datagrams to the same host does not trigger a lookup each time.
 async fn resolve_udp_target(
     dst: &UdpAddr,
     allow_private_targets: bool,
+    st: &ServerState,
 ) -> std::result::Result<std::net::SocketAddr, OpenError> {
     match dst {
         UdpAddr::V4(addr) => {
@@ -97,12 +101,58 @@ async fn resolve_udp_target(
                 Err(OpenError::Denied)
             }
         }
-        UdpAddr::Domain(host, port) => resolve_target(host, *port, allow_private_targets)
-            .await?
-            .into_iter()
-            .next()
-            .ok_or(OpenError::Denied),
+        UdpAddr::Domain(host, port) => {
+            let key = format!("{}:{port}", host.to_ascii_lowercase());
+            let now = Instant::now();
+            if let Some(addr) = st.udp_dns_cached(&key, now) {
+                // Re-check policy on the cached literal (defense in depth).
+                return if allow_private_targets || is_public_target(addr) {
+                    Ok(addr)
+                } else {
+                    Err(OpenError::Denied)
+                };
+            }
+            let addr = resolve_target(host, *port, allow_private_targets)
+                .await?
+                .into_iter()
+                .next()
+                .ok_or(OpenError::Denied)?;
+            st.udp_dns_store(key, addr, now);
+            Ok(addr)
+        }
     }
+}
+
+/// Extract the IPv4 address embedded in an IPv4/IPv6 translation prefix, if
+/// any. On a host that runs the matching mechanism (NAT64, 6to4, IPv4-mapped
+/// sockets) such an address routes to the embedded IPv4 target, so the IPv4
+/// policy must be applied to it — otherwise `64:ff9b::127.0.0.1` would slip
+/// past the private-range filter.
+fn embedded_ipv4(segments: [u16; 8]) -> Option<std::net::Ipv4Addr> {
+    let v4 = |hi: u16, lo: u16| {
+        std::net::Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8)
+    };
+    // ::ffff:a.b.c.d — IPv4-mapped
+    if segments[..5] == [0, 0, 0, 0, 0] && segments[5] == 0xffff {
+        return Some(v4(segments[6], segments[7]));
+    }
+    // ::ffff:0:a.b.c.d — IPv4-translated (RFC 6052 §2.2)
+    if segments[..4] == [0, 0, 0, 0] && segments[4] == 0xffff && segments[5] == 0 {
+        return Some(v4(segments[6], segments[7]));
+    }
+    // ::a.b.c.d — IPv4-compatible (deprecated, still routed by some stacks)
+    if segments[..6] == [0, 0, 0, 0, 0, 0] {
+        return Some(v4(segments[6], segments[7]));
+    }
+    // 64:ff9b::a.b.c.d — NAT64 well-known prefix (RFC 6052)
+    if segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2..6] == [0, 0, 0, 0] {
+        return Some(v4(segments[6], segments[7]));
+    }
+    // 2002:a.b.c.d::/48 — 6to4 (RFC 3056)
+    if segments[0] == 0x2002 {
+        return Some(v4(segments[1], segments[2]));
+    }
+    None
 }
 
 /// Return whether an address is safe for the default server egress policy.
@@ -132,13 +182,9 @@ pub fn is_public_target(addr: std::net::SocketAddr) -> bool {
         }
         std::net::IpAddr::V6(ip) => {
             let segments = ip.segments();
-            if segments[..5] == [0, 0, 0, 0, 0] && segments[5] == 0xffff {
-                let v4 = std::net::Ipv4Addr::new(
-                    (segments[6] >> 8) as u8,
-                    segments[6] as u8,
-                    (segments[7] >> 8) as u8,
-                    segments[7] as u8,
-                );
+            if let Some(v4) = embedded_ipv4(segments) {
+                // The prefix routes to the embedded IPv4: apply the IPv4
+                // policy to it rather than trusting the outer IPv6 form.
                 return is_public_target(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
                     v4,
                     addr.port(),
@@ -292,6 +338,7 @@ impl ServerHooks for Hooks {
     fn udp_feed(&self, sid: u32, dst: UdpAddr, data: Vec<u8>) -> crate::proto::mux::BoxFutUnit {
         let conn = self.conn.clone();
         let sink = self.sink.clone();
+        let st = self.st.clone();
         let allow_private_targets = self.st.allow_private_targets;
         Box::pin(async move {
             let relay = conn.udp_routes.get(&sid).map(|r| r.clone());
@@ -300,7 +347,7 @@ impl ServerHooks for Hooks {
                 return;
             };
             conn.touch(sid);
-            let Ok(addr) = resolve_udp_target(&dst, allow_private_targets).await else {
+            let Ok(addr) = resolve_udp_target(&dst, allow_private_targets, &st).await else {
                 debug!("udp_feed: resolve failed sid={sid}");
                 return;
             };
@@ -479,8 +526,14 @@ pub async fn handle_wt_stream(
     send: wtransport::SendStream,
     recv: wtransport::RecvStream,
 ) {
-    let mut writer = FrameWriter::new(send, conn.cipher.clone(), conn.stream_counters.clone());
-    let mut reader = FrameReader::new(recv, Some(conn.cipher.clone()), None);
+    let mut writer = FrameWriter::with_limit(
+        send,
+        conn.cipher.clone(),
+        conn.stream_counters.clone(),
+        conn.limit.clone(),
+    );
+    let mut reader =
+        FrameReader::with_limit(recv, Some(conn.cipher.clone()), None, conn.limit.clone());
 
     let first = match timeout(crate::proto::mux::HANDSHAKE_TIMEOUT, reader.read()).await {
         Ok(Ok(Some(f))) => f,
@@ -666,6 +719,9 @@ mod tests {
             seen_nonces: dashmap::DashMap::new(),
             nonce_lock: std::sync::Mutex::new(()),
             path: "/api/ppp".into(),
+            max_plaintext: crate::proto::frame::MAX_PLAINTEXT,
+            udp_dns: DashMap::new(),
+            udp_dns_ttl: Duration::from_secs(3600),
         });
         let conn = Arc::new(ConnState {
             id: 1,
@@ -679,6 +735,7 @@ mod tests {
             udp_routes: Default::default(),
             max_per_conn: 8,
             last_active: AtomicI64::new(now_millis()),
+            limit: crate::proto::frame::FrameLimit::new(crate::proto::frame::MAX_PLAINTEXT),
         });
         st.conns.insert(1, conn.clone());
         (st, conn)
@@ -771,5 +828,35 @@ mod tests {
         ] {
             assert!(!is_public_target(target.parse().unwrap()), "{target}");
         }
+    }
+
+    /// IPv6 transition/translation prefixes must be unwrapped to their
+    /// embedded IPv4 before the policy is applied: on a host running NAT64 or
+    /// 6to4 these route straight to the private target.
+    #[test]
+    fn public_target_policy_unwraps_ipv6_translation_prefixes() {
+        for target in [
+            "[64:ff9b::127.0.0.1]:80", // NAT64 well-known
+            "[64:ff9b::10.0.0.1]:80",  // NAT64 well-known, private
+            "[::ffff:0:127.0.0.1]:80", // IPv4-translated
+            "[::127.0.0.1]:80",        // IPv4-compatible
+            "[::10.0.0.1]:80",         // IPv4-compatible, private
+            "[2002:7f00:1::]:80",      // 6to4 embedding 127.0.0.1
+            "[2002:0a00:1::]:80",      // 6to4 embedding 10.0.0.1
+        ] {
+            assert!(!is_public_target(target.parse().unwrap()), "{target}");
+        }
+        // Public embedded IPv4 must still pass on every prefix.
+        for target in [
+            "[64:ff9b::8.8.8.8]:80",
+            "[::ffff:8.8.8.8]:80",
+            "[2002:0808:0808::]:80",
+        ] {
+            assert!(is_public_target(target.parse().unwrap()), "{target}");
+        }
+        // Ordinary public IPv6 (no embedded IPv4) is unaffected.
+        assert!(is_public_target(
+            "[2606:4700:4700::1111]:443".parse().unwrap()
+        ));
     }
 }

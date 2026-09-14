@@ -12,7 +12,8 @@ use wtransport::{Connection, Endpoint, Identity, ServerConfig};
 
 use crate::proto::crypto::{self, CounterGen, FrameCipher};
 use crate::proto::frame::{
-    FrameDecoder, FrameEncoder, FrameReader, FrameType, FrameWriter, ReplayWindow,
+    negotiate, FrameDecoder, FrameEncoder, FrameLimit, FrameReader, FrameType, FrameWriter,
+    ReplayWindow,
 };
 use crate::proto::mux::{FrameSink, OutFrame, ServerHooks};
 use crate::server::hub::{handle_wt_stream, Hooks};
@@ -120,12 +121,21 @@ async fn handle_wt_conn(
 
     let session_key = crypto::derive_session_key(&static_key, &ap.salt);
     let cipher = Arc::new(FrameCipher::new(&session_key));
+    // v2 negotiation: the session uses the smaller of both advertised limits.
+    let negotiated = negotiate(ap.max_plaintext, st.max_plaintext as u32);
+    let limit = FrameLimit::new(negotiated);
     reader.set_cipher(cipher.clone());
+    reader.limit().set(negotiated);
 
     let stream_counters = CounterGen::stream_server();
     let dgram_counters = CounterGen::datagram_server();
-    let mut writer = FrameWriter::new(send, cipher.clone(), stream_counters.clone());
-    writer.write(FrameType::AuthOk, 0, 0, &[]).await?;
+    let mut writer =
+        FrameWriter::with_limit(send, cipher.clone(), stream_counters.clone(), limit.clone());
+    // Echo the negotiated limit so the client can size its encoders before
+    // sending any data frame (>16 KiB frames are otherwise unencodable).
+    writer
+        .write(FrameType::AuthOk, 0, 0, &(negotiated as u32).to_le_bytes())
+        .await?;
     info!("wt conn authenticated uid={uid}");
 
     // ---- build connection state ----
@@ -146,6 +156,7 @@ async fn handle_wt_conn(
         udp_routes: Default::default(),
         max_per_conn: MAX_PER_CONN,
         last_active: std::sync::atomic::AtomicI64::new(crate::server::state::now_millis()),
+        limit: limit.clone(),
     });
     st.conns.insert(conn_id, conn_state.clone());
 
@@ -166,7 +177,11 @@ async fn handle_wt_conn(
 
     let sink_dgram = FrameSink::Datagram {
         conn: conn.clone(),
-        enc: Arc::new(FrameEncoder::new(cipher.clone(), dgram_counters.clone())),
+        enc: Arc::new(FrameEncoder::with_limit(
+            cipher.clone(),
+            dgram_counters.clone(),
+            limit.clone(),
+        )),
         fallback: ctrl_tx.clone(),
     };
 
@@ -233,8 +248,10 @@ async fn handle_wt_conn(
         let sink_dgram2 = sink_dgram.clone();
         let cipher2 = cipher.clone();
         let conn2 = conn.clone();
+        let limit2 = limit.clone();
         tokio::spawn(async move {
-            let mut dec = FrameDecoder::new(Some(cipher2), Some(ReplayWindow::new()));
+            let mut dec =
+                FrameDecoder::with_limit(Some(cipher2), Some(ReplayWindow::new()), limit2);
             while let Ok(d) = conn2.receive_datagram().await {
                 dec.feed(&d);
                 loop {

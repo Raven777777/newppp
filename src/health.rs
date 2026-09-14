@@ -165,12 +165,21 @@ fn healthcheck_once(url: &str) -> Result<String> {
     );
     s.write_all(req.as_bytes())
         .context("healthcheck: write failed")?;
+    // Cap the response: the snapshot is a fixed small JSON, so anything past
+    // this is a hostile or misconfigured endpoint and must not grow memory
+    // unbounded for the whole read timeout.
+    const MAX_RESP: usize = 64 * 1024;
     let mut resp = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
         match s.read(&mut chunk) {
             Ok(0) => break,
-            Ok(n) => resp.extend_from_slice(&chunk[..n]),
+            Ok(n) => {
+                resp.extend_from_slice(&chunk[..n]);
+                if resp.len() > MAX_RESP {
+                    anyhow::bail!("healthcheck: response exceeds {MAX_RESP} bytes");
+                }
+            }
             Err(e) => return Err(e).context("healthcheck: read failed"),
         }
     }
@@ -234,6 +243,8 @@ mod tests {
             recv_window: 1024,
             shutdown_grace: 10,
             health: None,
+            max_plaintext: crate::proto::frame::MAX_PLAINTEXT,
+            udp_dns_ttl: 3600,
         };
         let st = build_state(&cfg);
         let h = Health::new(

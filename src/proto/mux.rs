@@ -18,8 +18,8 @@ use tracing::{debug, warn};
 
 use super::addr::UdpAddr;
 use super::frame::{
-    decode_open, encode_open, FrameCipher, FrameDecoder, FrameEncoder, FrameReader, FrameType,
-    MAX_PLAINTEXT, OPEN_ERR_BAD_TARGET, OPEN_ERR_DENIED, OPEN_ERR_DIAL, OPEN_ERR_LIMIT,
+    decode_open, encode_open, FrameEncoder, FrameReader, FrameType, MAX_PLAINTEXT,
+    MAX_PLAINTEXT_CAP, OPEN_ERR_BAD_TARGET, OPEN_ERR_DENIED, OPEN_ERR_DIAL, OPEN_ERR_LIMIT,
 };
 use super::frame::{FLAG_FIN, FLAG_RST};
 
@@ -95,6 +95,16 @@ impl FrameSink {
     /// Fire-and-forget send for lossy UDP replies (drops when the queue is
     /// full instead of applying backpressure).
     pub fn try_send_lossy(&self, ftype: FrameType, flags: u16, sid: u32, payload: &[u8]) -> bool {
+        // Absolute protocol cap: anything larger can never be encoded on any
+        // path, so drop it before allocating a queue entry.
+        if payload.len() > MAX_PLAINTEXT_CAP {
+            debug!(
+                "dropping oversized lossy frame ({} bytes > {} cap)",
+                payload.len(),
+                MAX_PLAINTEXT_CAP
+            );
+            return false;
+        }
         let out = OutFrame::new(ftype, flags, sid, payload.to_vec());
         match self {
             FrameSink::Chan(tx) => matches!(tx.try_send(out), Ok(())),
@@ -103,11 +113,17 @@ impl FrameSink {
                 enc,
                 fallback,
             } => {
-                if let Ok(wire) = enc.encode(ftype, flags, sid, payload) {
-                    let max = conn.max_datagram_size().unwrap_or(0);
-                    if wire.len() <= max && conn.send_datagram(wire).is_ok() {
-                        return true;
-                    }
+                // Encode with the sink's negotiated limit. On failure the
+                // frame exceeds what this channel can carry: drop it instead
+                // of queueing an unencodable frame for the fallback writer
+                // (which would abort the whole control channel).
+                let Ok(wire) = enc.encode(ftype, flags, sid, payload) else {
+                    debug!("dropping lossy frame above the negotiated limit");
+                    return false;
+                };
+                let max = conn.max_datagram_size().unwrap_or(0);
+                if wire.len() <= max && conn.send_datagram(wire).is_ok() {
+                    return true;
                 }
                 matches!(fallback.try_send(out), Ok(()))
             }
@@ -227,13 +243,13 @@ impl MuxClient {
         self.inner.closed.is_cancelled()
     }
 
-    /// Start the mux with an existing body channel: `body_tx` is given to the
-    /// internal writer task (the caller already put any prelude bytes into
-    /// the channel, e.g. the in-band AUTH frame).
-    pub fn start_with_tx<R>(
-        reader: R,
+    /// Start the mux with an established duplex channel: `reader` already
+    /// carries the session cipher and negotiated frame limit, and `body_tx` is
+    /// given to the internal writer task (the caller already put any prelude
+    /// bytes into the channel, e.g. the in-band AUTH frame).
+    pub fn start_with_reader<R>(
+        reader: FrameReader<R>,
         enc: FrameEncoder,
-        cipher: Arc<FrameCipher>,
         body_tx: mpsc::Sender<Bytes>,
     ) -> MuxClient
     where
@@ -268,7 +284,7 @@ impl MuxClient {
         });
 
         let i2 = inner.clone();
-        tokio::spawn(run_client_reader(i2, reader, cipher));
+        tokio::spawn(run_client_reader(i2, reader));
 
         MuxClient { inner }
     }
@@ -420,33 +436,19 @@ impl MuxClient {
     }
 }
 
-async fn run_client_reader<R: AsyncRead + Unpin>(
-    inner: Arc<MuxInner>,
-    mut r: R,
-    cipher: Arc<FrameCipher>,
-) {
-    let mut dec = FrameDecoder::new(Some(cipher), None);
-    let mut buf = [0u8; 16 * 1024];
+async fn run_client_reader<R: AsyncRead + Unpin>(inner: Arc<MuxInner>, mut reader: FrameReader<R>) {
     loop {
-        let n = match r.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(_) => break,
-        };
-        dec.feed(&buf[..n]);
-        loop {
-            match dec.next_frame() {
-                Ok(Some(f)) => {
-                    if handle_client_frame(&inner, f).await {
-                        return;
-                    }
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    debug!("mux client: bad frame: {e}");
-                    inner.teardown_all();
+        match reader.read().await {
+            Ok(Some(f)) => {
+                if handle_client_frame(&inner, f).await {
                     return;
                 }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                debug!("mux client: bad frame: {e}");
+                inner.teardown_all();
+                return;
             }
         }
     }
@@ -705,6 +707,7 @@ async fn handle_server_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::crypto::FrameCipher;
     use crate::proto::frame::Frame;
     use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -847,6 +850,22 @@ mod tests {
 
     fn test_sink() -> FrameSink {
         FrameSink::Chan(mpsc::channel(1).0)
+    }
+
+    /// A frame above the absolute protocol cap can never be encoded on any
+    /// path; it must be dropped at the sink rather than queued, because the
+    /// fallback writer aborts on an encode error and would kill every session
+    /// on the channel.
+    #[test]
+    fn lossy_sink_drops_oversized_frame() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let sink = FrameSink::Chan(tx);
+        assert!(!sink.try_send_lossy(FrameType::UdpData, 0, 1, &vec![0u8; MAX_PLAINTEXT_CAP + 1]));
+        assert!(rx.try_recv().is_err(), "oversized frame must not be queued");
+        // A frame at the cap is still accepted (the negotiated limit, applied
+        // by the encoder, is the tighter bound).
+        assert!(sink.try_send_lossy(FrameType::UdpData, 0, 1, &vec![0u8; MAX_PLAINTEXT_CAP]));
+        assert!(rx.try_recv().is_ok());
     }
 
     /// Close+FIN from the client is a half-close: route it to `feed_tcp` and

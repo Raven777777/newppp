@@ -338,11 +338,23 @@ pub struct AuthPayload {
     pub nonce: [u8; SALT_LEN],
     pub uid: String,
     pub mac: [u8; MAC_LEN],
+    /// Advertised receive capability: the largest plaintext frame payload this
+    /// peer accepts (v2). The session uses the smaller of both peers' values.
+    /// Absent in v1 payloads, where it defaults to the 16 KiB baseline.
+    pub max_plaintext: u32,
 }
 
 impl AuthPayload {
     pub fn encode(&self) -> Vec<u8> {
-        let mut v = Vec::with_capacity(1 + 16 + 8 + 16 + 1 + self.uid.len() + 32);
+        // The wire length field is one byte: an over-long uid would silently
+        // truncate and desync the decoder. Config validation caps uid at 32
+        // chars; assert the invariant here rather than widening the API.
+        debug_assert!(
+            self.uid.len() <= u8::MAX as usize,
+            "uid length {} exceeds the u8 wire field",
+            self.uid.len()
+        );
+        let mut v = Vec::with_capacity(1 + 16 + 8 + 16 + 1 + self.uid.len() + 32 + 4);
         v.push(self.proto_version);
         v.extend_from_slice(&self.salt);
         v.extend_from_slice(&self.ts.to_le_bytes());
@@ -350,6 +362,9 @@ impl AuthPayload {
         v.push(self.uid.len() as u8);
         v.extend_from_slice(self.uid.as_bytes());
         v.extend_from_slice(&self.mac);
+        // Appended after the v1 prefix: a v1 peer still decodes the fields it
+        // knows and then reports a version mismatch, instead of failing decode.
+        v.extend_from_slice(&self.max_plaintext.to_le_bytes());
         v
     }
 
@@ -378,6 +393,13 @@ impl AuthPayload {
         p += ul;
         let mut mac = [0u8; MAC_LEN];
         mac.copy_from_slice(&b[p..p + 32]);
+        p += 32;
+        // v2 appends the advertised frame limit; a v1 payload ends here.
+        let max_plaintext = if b.len() >= p + 4 {
+            u32::from_le_bytes([b[p], b[p + 1], b[p + 2], b[p + 3]])
+        } else {
+            crate::proto::frame::MAX_PLAINTEXT as u32
+        };
         Ok(Self {
             proto_version,
             salt,
@@ -385,6 +407,7 @@ impl AuthPayload {
             nonce,
             uid,
             mac,
+            max_plaintext,
         })
     }
 
@@ -508,6 +531,7 @@ mod tests {
             nonce,
             uid: "u1".into(),
             mac: auth_mac(&key, "u1", u64::MAX, &nonce),
+            max_plaintext: crate::proto::frame::MAX_PLAINTEXT as u32,
         };
         assert!(!ap.verify(&key, AUTH_WINDOW));
     }
@@ -526,12 +550,14 @@ mod tests {
             nonce,
             uid: "u1".into(),
             mac,
+            max_plaintext: 64 * 1024,
         };
         let enc = ap.encode();
         let dec = AuthPayload::decode(&enc).unwrap();
         assert!(dec.verify(&key, AUTH_WINDOW));
         assert!(dec.proto_version_compatible());
         assert_eq!(dec.salt, [9u8; 16]);
+        assert_eq!(dec.max_plaintext, 64 * 1024);
 
         // A wrong version must survive decode and be reported as incompatible
         // (not swallowed by a generic decrypt failure).
@@ -582,6 +608,7 @@ mod proptests {
             nonce in proptest::array::uniform16(any::<u8>()),
             ts in any::<u64>(),
             uid in "[A-Za-z0-9_-]{1,32}",
+            max_plaintext in any::<u32>(),
         ) {
             let key = derive_static_key("pw", &uid);
             let mac = auth_mac(&key, &uid, ts, &nonce);
@@ -592,6 +619,7 @@ mod proptests {
                 nonce,
                 uid: uid.clone(),
                 mac,
+                max_plaintext,
             };
             let dec = AuthPayload::decode(&ap.encode()).expect("valid encoding");
             prop_assert_eq!(dec.proto_version, crate::proto::frame::PROTO_VERSION);
@@ -600,6 +628,32 @@ mod proptests {
             prop_assert_eq!(dec.nonce, nonce);
             prop_assert_eq!(dec.uid, uid);
             prop_assert_eq!(dec.mac, mac);
+            prop_assert_eq!(dec.max_plaintext, max_plaintext);
+        }
+
+        /// A v1 payload (no trailing limit field) must still decode, using the
+        /// 16 KiB baseline, so a version skew is reported as a mismatch rather
+        /// than a decode failure.
+        #[test]
+        fn v1_auth_payload_decodes_with_baseline_limit(
+            salt in proptest::array::uniform16(any::<u8>()),
+            nonce in proptest::array::uniform16(any::<u8>()),
+            ts in any::<u64>(),
+            uid in "[A-Za-z0-9_-]{1,32}",
+        ) {
+            let key = derive_static_key("pw", &uid);
+            let mac = auth_mac(&key, &uid, ts, &nonce);
+            let mut v1 = Vec::new();
+            v1.push(1u8); // v1
+            v1.extend_from_slice(&salt);
+            v1.extend_from_slice(&ts.to_le_bytes());
+            v1.extend_from_slice(&nonce);
+            v1.push(uid.len() as u8);
+            v1.extend_from_slice(uid.as_bytes());
+            v1.extend_from_slice(&mac);
+            let dec = AuthPayload::decode(&v1).expect("v1 payload decodes");
+            prop_assert_eq!(dec.proto_version, 1);
+            prop_assert_eq!(dec.max_plaintext, crate::proto::frame::MAX_PLAINTEXT as u32);
         }
     }
 }

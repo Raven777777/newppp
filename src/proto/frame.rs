@@ -14,6 +14,7 @@
 //! AAD = header[0..12]. Payload is encrypted with the session key
 //! (the Auth frame is sealed with the user's static key instead).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{ensure, Result};
@@ -23,13 +24,62 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 // Re-exported for downstream modules (mux, server, client).
 pub use super::crypto::{CounterGen, FrameCipher, ReplayWindow, TAG_LEN};
 
-pub const PROTO_VERSION: u8 = 1;
+/// Wire protocol version.
+///
+/// v1 used a fixed 16 KiB frame payload limit; v2 negotiates the limit during
+/// the AUTH handshake (each peer advertises what it accepts, the session uses
+/// the smaller value). A version skew is surfaced as an explicit mismatch by
+/// the AUTH layer, never as a decode failure.
+pub const PROTO_VERSION: u8 = 2;
 pub const HEADER_LEN: usize = 20;
+/// Baseline frame payload limit: the v1 maximum and the negotiated floor.
+/// Keeping it as the floor means every existing 16 KiB read buffer stays
+/// valid; only UDP payloads gain from a larger negotiated value.
 pub const MAX_PLAINTEXT: usize = 16 * 1024;
+/// Absolute protocol cap on the negotiated limit, bounding the memory one
+/// frame can make a decoder buffer.
+pub const MAX_PLAINTEXT_CAP: usize = 1024 * 1024;
 pub const MAX_CIPHERTEXT: usize = MAX_PLAINTEXT + TAG_LEN;
 
 pub const FLAG_FIN: u16 = 0x0001;
 pub const FLAG_RST: u16 = 0x0002;
+
+/// Negotiated plaintext frame limit: the smaller of both peers' advertised
+/// receive capabilities, clamped to `[MAX_PLAINTEXT, MAX_PLAINTEXT_CAP]`.
+pub fn negotiate(client: u32, server: u32) -> usize {
+    (client as usize)
+        .min(server as usize)
+        .clamp(MAX_PLAINTEXT, MAX_PLAINTEXT_CAP)
+}
+
+/// Shared per-connection plaintext frame limit.
+///
+/// An `Arc<AtomicUsize>` because encoders/decoders are constructed before the
+/// negotiated value is known (the AUTH reply carries it); the value is set
+/// exactly once, before any data frame is exchanged, and every encoder and
+/// decoder of that connection shares one handle.
+#[derive(Clone)]
+pub struct FrameLimit(Arc<AtomicUsize>);
+
+impl FrameLimit {
+    pub fn new(max_plaintext: usize) -> Self {
+        Self(Arc::new(AtomicUsize::new(max_plaintext)))
+    }
+
+    pub fn get(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    pub fn set(&self, max_plaintext: usize) {
+        self.0.store(max_plaintext, Ordering::Relaxed);
+    }
+}
+
+impl Default for FrameLimit {
+    fn default() -> Self {
+        Self::new(MAX_PLAINTEXT)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -138,11 +188,27 @@ pub fn parse_header(h: &[u8; HEADER_LEN]) -> Result<HeaderInfo> {
 pub struct FrameEncoder {
     cipher: Arc<FrameCipher>,
     counters: CounterGen,
+    limit: FrameLimit,
 }
 
 impl FrameEncoder {
     pub fn new(cipher: Arc<FrameCipher>, counters: CounterGen) -> Self {
-        Self { cipher, counters }
+        Self::with_limit(cipher, counters, FrameLimit::default())
+    }
+
+    /// Construct sharing an explicit (negotiated) frame limit.
+    pub fn with_limit(cipher: Arc<FrameCipher>, counters: CounterGen, limit: FrameLimit) -> Self {
+        Self {
+            cipher,
+            counters,
+            limit,
+        }
+    }
+
+    /// The shared limit handle, so a connection can publish its negotiated
+    /// value to every encoder created from it.
+    pub fn limit(&self) -> FrameLimit {
+        self.limit.clone()
     }
 
     /// Append one encoded frame to `out`. `out` can be reused across frames
@@ -155,7 +221,7 @@ impl FrameEncoder {
         payload: &[u8],
         out: &mut BytesMut,
     ) -> Result<()> {
-        ensure!(payload.len() <= MAX_PLAINTEXT, "frame payload too large");
+        ensure!(payload.len() <= self.limit.get(), "frame payload too large");
         let counter = self.counters.next();
         let header = build_header(ftype, flags, sid, payload.len() + TAG_LEN, counter);
         out.extend_from_slice(&header);
@@ -180,18 +246,34 @@ impl FrameEncoder {
 pub struct FrameDecoder {
     cipher: Option<Arc<FrameCipher>>,
     window: Option<ReplayWindow>,
+    limit: FrameLimit,
     buf: BytesMut,
     pub raw: bool,
 }
 
 impl FrameDecoder {
     pub fn new(cipher: Option<Arc<FrameCipher>>, window: Option<ReplayWindow>) -> Self {
+        Self::with_limit(cipher, window, FrameLimit::default())
+    }
+
+    /// Construct sharing an explicit (negotiated) frame limit.
+    pub fn with_limit(
+        cipher: Option<Arc<FrameCipher>>,
+        window: Option<ReplayWindow>,
+        limit: FrameLimit,
+    ) -> Self {
         Self {
             cipher,
             window,
+            limit,
             buf: BytesMut::new(),
             raw: false,
         }
+    }
+
+    /// The shared limit handle (see [`FrameEncoder::limit`]).
+    pub fn limit(&self) -> FrameLimit {
+        self.limit.clone()
     }
 
     pub fn set_cipher(&mut self, cipher: Arc<FrameCipher>) {
@@ -220,8 +302,9 @@ impl FrameDecoder {
         let mut header = [0u8; HEADER_LEN];
         header.copy_from_slice(&self.buf[..HEADER_LEN]);
         let info = parse_header(&header)?;
+        let max_ct = self.limit.get().saturating_add(TAG_LEN);
         ensure!(
-            info.ct_len >= TAG_LEN && info.ct_len <= MAX_CIPHERTEXT,
+            info.ct_len >= TAG_LEN && info.ct_len <= max_ct,
             "invalid frame length {}",
             info.ct_len
         );
@@ -264,10 +347,25 @@ pub struct FrameReader<R> {
 
 impl<R: AsyncRead + Unpin> FrameReader<R> {
     pub fn new(r: R, cipher: Option<Arc<FrameCipher>>, window: Option<ReplayWindow>) -> Self {
+        Self::with_limit(r, cipher, window, FrameLimit::default())
+    }
+
+    /// Construct sharing an explicit (negotiated) frame limit.
+    pub fn with_limit(
+        r: R,
+        cipher: Option<Arc<FrameCipher>>,
+        window: Option<ReplayWindow>,
+        limit: FrameLimit,
+    ) -> Self {
         Self {
             r,
-            dec: FrameDecoder::new(cipher, window),
+            dec: FrameDecoder::with_limit(cipher, window, limit),
         }
+    }
+
+    /// The shared limit handle (see [`FrameEncoder::limit`]).
+    pub fn limit(&self) -> FrameLimit {
+        self.dec.limit()
     }
 
     pub fn set_cipher(&mut self, cipher: Arc<FrameCipher>) {
@@ -305,15 +403,32 @@ pub struct FrameWriter<W> {
 
 impl<W: AsyncWrite + Unpin> FrameWriter<W> {
     pub fn new(w: W, cipher: Arc<FrameCipher>, counters: CounterGen) -> Self {
+        Self::with_limit(w, cipher, counters, FrameLimit::default())
+    }
+
+    /// Construct sharing an explicit (negotiated) frame limit.
+    pub fn with_limit(
+        w: W,
+        cipher: Arc<FrameCipher>,
+        counters: CounterGen,
+        limit: FrameLimit,
+    ) -> Self {
         Self {
             w,
-            enc: FrameEncoder::new(cipher, counters),
+            enc: FrameEncoder::with_limit(cipher, counters, limit),
             buf: BytesMut::new(),
         }
     }
 
+    /// The shared limit handle (see [`FrameEncoder::limit`]).
+    pub fn limit(&self) -> FrameLimit {
+        self.enc.limit()
+    }
+
     pub fn set_cipher(&mut self, cipher: Arc<FrameCipher>) {
-        self.enc = FrameEncoder::new(cipher, self.enc.counters.clone());
+        let counters = self.enc.counters.clone();
+        let limit = self.enc.limit();
+        self.enc = FrameEncoder::with_limit(cipher, counters, limit);
     }
 
     pub async fn write(

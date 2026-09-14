@@ -98,7 +98,8 @@ async fn api_handler(State(st): State<Arc<ServerState>>, req: Request) -> Respon
     drop(guard);
 
     let (resp_tx, resp_rx) = mpsc::channel::<Bytes>(256);
-    spawn_mode_a_channel(st, uid, static_key, ap, reader, resp_tx);
+    let negotiated = crate::proto::frame::negotiate(ap.max_plaintext, st.max_plaintext as u32);
+    spawn_mode_a_channel(st, uid, static_key, ap, reader, resp_tx, negotiated);
 
     let stream = ReceiverStream::new(resp_rx).map(Ok::<_, Infallible>);
     Response::builder()
@@ -193,7 +194,8 @@ async fn ws_channel(st: Arc<ServerState>, socket: WebSocket) {
         }
         let _ = sink.send(Message::Close(None)).await;
     });
-    spawn_mode_a_channel(st, uid, static_key, ap, reader, resp_tx);
+    let negotiated = crate::proto::frame::negotiate(ap.max_plaintext, st.max_plaintext as u32);
+    spawn_mode_a_channel(st, uid, static_key, ap, reader, resp_tx, negotiated);
 }
 
 /// Read and verify the in-band AUTH frame (first frame of the channel,
@@ -216,7 +218,9 @@ where
 }
 
 /// Establish the connection state and drive the mode-A mux loop; wire bytes
-/// for the peer are emitted through `resp_tx`.
+/// for the peer are emitted through `resp_tx`. `negotiated` is the frame limit
+/// agreed with the client; it is echoed as the first frame (AuthOk) so the
+/// client can size its encoders before sending data.
 fn spawn_mode_a_channel<R>(
     st: Arc<ServerState>,
     uid: String,
@@ -224,12 +228,15 @@ fn spawn_mode_a_channel<R>(
     ap: AuthPayload,
     mut reader: FrameReader<R>,
     resp_tx: mpsc::Sender<Bytes>,
+    negotiated: usize,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
 {
     let session_key = crate::proto::crypto::derive_session_key(&static_key, &ap.salt);
     let cipher = Arc::new(crate::proto::crypto::FrameCipher::new(&session_key));
+    let limit = crate::proto::frame::FrameLimit::new(negotiated);
     reader.set_cipher(cipher.clone());
+    reader.limit().set(negotiated);
 
     let conn_id = st.conn_seq.fetch_add(1, Ordering::Relaxed);
     let cancel = CancellationToken::new();
@@ -246,12 +253,13 @@ fn spawn_mode_a_channel<R>(
         udp_routes: Default::default(),
         max_per_conn: crate::server::wt::MAX_PER_CONN,
         last_active: std::sync::atomic::AtomicI64::new(crate::server::state::now_millis()),
+        limit: limit.clone(),
     });
     st.conns.insert(conn_id, conn.clone());
 
     let (frame_tx, mut frame_rx) = mpsc::channel::<OutFrame>(256);
     {
-        let enc = FrameEncoder::new(cipher.clone(), conn.stream_counters.clone());
+        let enc = FrameEncoder::with_limit(cipher.clone(), conn.stream_counters.clone(), limit);
         tokio::spawn(async move {
             while let Some(f) = frame_rx.recv().await {
                 match enc.encode(f.ftype, f.flags, f.sid, &f.payload) {
@@ -260,11 +268,21 @@ fn spawn_mode_a_channel<R>(
                             break;
                         }
                     }
-                    Err(_) => break,
+                    // A frame above the negotiated limit is dropped, not fatal:
+                    // the writer must not abort the whole channel over one
+                    // oversized (UDP) payload.
+                    Err(e) => warn!("fallback: dropping unencodable frame: {e}"),
                 }
             }
         });
     }
+    // Negotiation reply, ahead of any mux traffic.
+    let _ = frame_tx.try_send(OutFrame::new(
+        FrameType::AuthOk,
+        0,
+        0,
+        (negotiated as u32).to_le_bytes().to_vec(),
+    ));
 
     tokio::spawn(async move {
         let sink = FrameSink::Chan(frame_tx);

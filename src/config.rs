@@ -85,6 +85,13 @@ pub struct Cli {
     #[arg(long = "recv-window", value_name = "MB", default_value_t = 2)]
     pub recv_window_mb: u64,
 
+    /// [client+server] maximum plaintext frame payload, KB (16..=1024).
+    /// Advertised during the AUTH handshake and negotiated as the smaller of
+    /// both peers' values; a larger value lets one frame carry a bigger UDP
+    /// datagram. Default 16 = the protocol baseline.
+    #[arg(long = "max-frame-kb", value_name = "KB", default_value_t = 16)]
+    pub max_frame_kb: u64,
+
     // ---------------- server options ----------------
     /// [server] WebTransport (QUIC over UDP) listen address; omit to disable
     /// the WT listener entirely (pure-website mode, nothing to firewall)
@@ -131,6 +138,10 @@ pub struct Cli {
     /// [server] idle session timeout, seconds
     #[arg(long = "idle", value_name = "SECS", default_value_t = 60)]
     pub idle_secs: u64,
+
+    /// [server] TTL of the UDP target DNS cache, seconds (0 = disable caching)
+    #[arg(long = "udp-dns-ttl", value_name = "SECS", default_value_t = 3600)]
+    pub udp_dns_ttl: u64,
 
     /// [server] allow connections to loopback, private, link-local and other
     /// non-public addresses (disabled by default to prevent SSRF)
@@ -190,6 +201,8 @@ pub struct ClientConfig {
     pub pin: Option<[u8; 32]>,
     pub recv_window: u32,
     pub health: Option<String>,
+    /// Advertised/negotiated plaintext frame limit (bytes).
+    pub max_plaintext: usize,
 }
 
 /// Where the server loads its TLS material from.
@@ -216,6 +229,10 @@ pub struct ServerConfig {
     pub recv_window: u32,
     pub shutdown_grace: u64,
     pub health: Option<String>,
+    /// Advertised/negotiated plaintext frame limit (bytes).
+    pub max_plaintext: usize,
+    /// UDP target DNS cache TTL (seconds; 0 disables caching).
+    pub udp_dns_ttl: u64,
 }
 
 fn parse_auth(raw: &str) -> anyhow::Result<(String, String)> {
@@ -365,6 +382,7 @@ impl Cli {
             sni: self.sni.clone(),
             pin,
             recv_window: recv_window_bytes(self.recv_window_mb)?,
+            max_plaintext: max_frame_bytes(self.max_frame_kb)?,
             health: self.health.clone(),
         })
     }
@@ -416,6 +434,8 @@ impl Cli {
             max_unauth: self.max_unauth.max(1),
             recv_window: recv_window_bytes(self.recv_window_mb)?,
             shutdown_grace: self.shutdown_grace,
+            max_plaintext: max_frame_bytes(self.max_frame_kb)?,
+            udp_dns_ttl: self.udp_dns_ttl,
             health: self.health.clone(),
         })
     }
@@ -438,6 +458,17 @@ fn recv_window_bytes(mb: u64) -> anyhow::Result<u32> {
         "--recv-window must be 1..=64 MB, got {mb}"
     );
     Ok(mb as u32 * 1024 * 1024)
+}
+
+/// `--max-frame-kb`: bounded by the protocol's absolute cap so a single frame
+/// cannot make a decoder allocate without limit.
+fn max_frame_bytes(kb: u64) -> anyhow::Result<usize> {
+    let cap_kb = (crate::proto::frame::MAX_PLAINTEXT_CAP / 1024) as u64;
+    anyhow::ensure!(
+        (16..=cap_kb).contains(&kb),
+        "--max-frame-kb must be 16..={cap_kb}, got {kb}"
+    );
+    Ok(kb as usize * 1024)
 }
 
 /// Parse a `--pin` SHA-256 certificate fingerprint: 64 hex chars (colons
@@ -878,7 +909,10 @@ mod tests {
             .map(String::from)
             .collect();
         strip_cli_overridden(&mut file_args, &cli_args);
-        assert!(!file_args.contains(&"-c".to_string()) || true);
+        assert!(
+            !file_args.contains(&"-s".to_string()),
+            "CLI mode must drop the file's mode"
+        );
         let cli = Cli::try_parse_from(
             std::iter::once("newppp".to_string())
                 .chain(file_args.iter().map(|s| s.to_string()))

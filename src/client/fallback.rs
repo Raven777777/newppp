@@ -35,8 +35,8 @@ use crate::config::ClientConfig;
 use crate::proto::crypto::{
     auth_mac, derive_session_key, make_bearer, AuthPayload, CounterGen, FrameCipher, SALT_LEN,
 };
-use crate::proto::frame::{random_padding, FrameEncoder, FrameType};
-use crate::proto::mux::{BoxStream, MuxClient, UdpPipe};
+use crate::proto::frame::{random_padding, FrameEncoder, FrameLimit, FrameReader, FrameType};
+use crate::proto::mux::{BoxStream, MuxClient, UdpPipe, HANDSHAKE_TIMEOUT};
 use crate::proto::stream::StreamAsRead;
 use crate::proto::USER_AGENT;
 
@@ -51,6 +51,8 @@ pub struct HttpOutbound {
     client: Option<HyperClient>,
     ws_tls: Option<Arc<rustls::ClientConfig>>,
     mux: Mutex<Option<Arc<MuxClient>>>,
+    /// Advertised/negotiated plaintext frame limit (bytes).
+    max_plaintext: usize,
 }
 
 impl HttpOutbound {
@@ -97,6 +99,7 @@ impl HttpOutbound {
             client,
             ws_tls,
             mux: Mutex::new(None),
+            max_plaintext: cfg.max_plaintext,
         })
     }
 
@@ -136,10 +139,12 @@ impl HttpOutbound {
             nonce,
             uid: self.uid.clone(),
             mac,
+            max_plaintext: self.max_plaintext as u32,
         };
         let session_key = derive_session_key(&self.static_key, &salt);
         let cipher = Arc::new(FrameCipher::new(&session_key));
-        let enc = FrameEncoder::new(cipher.clone(), CounterGen::stream());
+        let limit = FrameLimit::new(self.max_plaintext);
+        let enc = FrameEncoder::with_limit(cipher.clone(), CounterGen::stream(), limit.clone());
 
         // prelude: AUTH frame sealed with the static key, first bytes either
         // way. Random tail pads the ciphertext length away from a fixed
@@ -155,9 +160,9 @@ impl HttpOutbound {
         )?;
 
         if self.ws {
-            self.connect_ws(auth_wire, enc, cipher).await
+            self.connect_ws(auth_wire, enc, cipher, limit).await
         } else {
-            self.connect_post(auth_wire, enc, cipher).await
+            self.connect_post(auth_wire, enc, cipher, limit).await
         }
     }
 
@@ -166,6 +171,7 @@ impl HttpOutbound {
         auth_wire: Bytes,
         enc: FrameEncoder,
         cipher: Arc<FrameCipher>,
+        limit: FrameLimit,
     ) -> Result<MuxClient> {
         let client = self
             .client
@@ -213,7 +219,7 @@ impl HttpOutbound {
         }
 
         let reader = BodyAsRead::new(resp.into_body());
-        Ok(MuxClient::start_with_tx(reader, enc, cipher, body_tx))
+        handshake_mux(reader, cipher, enc, limit, body_tx).await
     }
 
     async fn connect_ws(
@@ -221,6 +227,7 @@ impl HttpOutbound {
         auth_wire: Bytes,
         enc: FrameEncoder,
         cipher: Arc<FrameCipher>,
+        limit: FrameLimit,
     ) -> Result<MuxClient> {
         let tls = self
             .ws_tls
@@ -310,7 +317,7 @@ impl HttpOutbound {
 
         let reader =
             StreamAsRead::new(ReceiverStream::new(in_rx).map(Ok::<_, std::convert::Infallible>));
-        Ok(MuxClient::start_with_tx(reader, enc, cipher, body_tx))
+        handshake_mux(reader, cipher, enc, limit, body_tx).await
     }
 
     pub async fn open_tcp(self: &Arc<Self>, host: &str, port: u16) -> Result<BoxStream> {
@@ -334,6 +341,34 @@ impl HttpOutbound {
         let mux = self.ensure_mux().await?;
         mux.udp_associate().await
     }
+}
+
+/// Read the server's `AuthOk`, which carries the negotiated frame limit:
+/// adopt it, then hand the channel to the mode-A mux. Shared by both transports.
+async fn handshake_mux<R>(
+    reader: R,
+    cipher: Arc<FrameCipher>,
+    enc: FrameEncoder,
+    limit: FrameLimit,
+    body_tx: mpsc::Sender<Bytes>,
+) -> Result<MuxClient>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let mut fr = FrameReader::with_limit(reader, Some(cipher), None, limit.clone());
+    let f = timeout(HANDSHAKE_TIMEOUT, fr.read())
+        .await
+        .map_err(|_| anyhow!("auth reply timeout"))?
+        .map_err(|e| anyhow!("auth reply: {e}"))?
+        .ok_or_else(|| anyhow!("channel closed during auth"))?;
+    anyhow::ensure!(f.ftype == FrameType::AuthOk, "unexpected auth reply");
+    let n = f
+        .payload
+        .get(..4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .ok_or_else(|| anyhow!("short auth reply"))?;
+    limit.set(crate::proto::frame::negotiate(n, limit.get() as u32));
+    Ok(MuxClient::start_with_reader(fr, enc, body_tx))
 }
 
 fn build_client(
@@ -361,11 +396,14 @@ fn build_client(
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let tls_builder = rustls::ClientConfig::builder_with_provider(provider.clone());
     let tls_builder = if pin.is_some() {
+        // Random GREASE placeholder key, matching the WT path: an all-zero
+        // X25519 public key is a fixed, non-browser signature (and a
+        // degenerate DH input), while GREASE ECH must look like a real offer.
         tls_builder
             .with_ech(rustls::client::EchMode::Grease(
                 rustls::client::EchGreaseConfig::new(
                     &super::ech::HpkeX25519Sha256ChaCha20,
-                    rustls::crypto::hpke::HpkePublicKey(vec![0u8; 32]),
+                    rustls::crypto::hpke::HpkePublicKey(super::wt::rand_bytes_32()),
                 ),
             ))
             .map_err(|e| anyhow!("ech grease enable: {e}"))?

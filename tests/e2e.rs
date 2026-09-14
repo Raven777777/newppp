@@ -70,6 +70,8 @@ fn client_cfg(wt: Option<String>, fb: Option<String>) -> ClientConfig {
         pin: None,
         recv_window: 2 * 1024 * 1024,
         health: None,
+        // Exercise v2 frame-limit negotiation above the 16 KiB baseline.
+        max_plaintext: 64 * 1024,
     }
 }
 
@@ -151,6 +153,8 @@ fn server_cfg(allow_private: bool, wrong_pass: bool) -> ServerConfig {
         recv_window: 2 * 1024 * 1024,
         shutdown_grace: 10,
         health: None,
+        max_plaintext: 64 * 1024,
+        udp_dns_ttl: 3600,
     }
 }
 
@@ -726,6 +730,27 @@ async fn udp_over_mtu_falls_back_to_stream() {
     srv.shutdown().await;
 }
 
+/// v2 frame-limit negotiation: the e2e configs advertise 64 KiB, so a UDP
+/// payload well above the old fixed 16 KiB baseline must traverse a single
+/// stream frame instead of being dropped or tearing the session down.
+#[tokio::test]
+async fn udp_large_payload_over_negotiated_limit() {
+    let srv = spawn_server(true).await.expect("server");
+    let echo = spawn_udp_echo().await.expect("udp echo");
+    let cli = start_client(client_cfg(Some(srv.wt_url()), None), false)
+        .await
+        .expect("client");
+
+    let payload = vec![0xC7u8; 48 * 1024];
+    let (_ctrl, relay) = socks5_udp_associate(cli.socks_port).await;
+    let got = udp_roundtrip(&relay, echo.port, &payload).await;
+    assert!(got.starts_with(b"echo:"), "missing echo prefix");
+    assert_eq!(&got[5..], &payload[..], "48 KiB payload corrupted");
+
+    cli.shutdown().await;
+    srv.shutdown().await;
+}
+
 /// 5b: a mode-A (HTTPS POST) UDP ASSOCIATE rejected by the server session cap
 /// must fail fast with a SOCKS5 error reply, not hang until the 10s in-band
 /// handshake timeout. Regression: the mode-A client only checked the TCP
@@ -887,6 +912,7 @@ async fn auth_matrix() {
         nonce: [9u8; SALT_LEN],
         uid: UID.into(),
         mac: auth_mac(&wrong_key, UID, ts, &[9u8; SALT_LEN]),
+        max_plaintext: 64 * 1024,
     };
     writer
         .write(FrameType::Auth, 0, 0, &ap.encode())
@@ -938,6 +964,7 @@ async fn complete_wt_auth(conn: wtransport::Connection) -> Result<()> {
         nonce,
         uid: UID.into(),
         mac: auth_mac(&key, UID, ts, &nonce),
+        max_plaintext: 64 * 1024,
     };
     writer
         .write(FrameType::Auth, 0, 0, &ap.encode())

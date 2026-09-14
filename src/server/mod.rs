@@ -49,6 +49,9 @@ pub fn build_state(cfg: &ServerConfig) -> Arc<ServerState> {
         seen_nonces: DashMap::new(),
         nonce_lock: std::sync::Mutex::new(()),
         path: cfg.path.clone(),
+        max_plaintext: cfg.max_plaintext,
+        udp_dns: DashMap::new(),
+        udp_dns_ttl: Duration::from_secs(cfg.udp_dns_ttl),
     })
 }
 
@@ -384,6 +387,9 @@ mod tests {
             seen_nonces: DashMap::new(),
             nonce_lock: std::sync::Mutex::new(()),
             path: "/api/ppp".into(),
+            max_plaintext: crate::proto::frame::MAX_PLAINTEXT,
+            udp_dns: DashMap::new(),
+            udp_dns_ttl: Duration::from_secs(3600),
         }
     }
 
@@ -434,6 +440,7 @@ mod tests {
             nonce,
             uid: "alice".into(),
             mac: crypto::auth_mac(key, "alice", ts, &nonce),
+            max_plaintext: crate::proto::frame::MAX_PLAINTEXT as u32,
         }
     }
 
