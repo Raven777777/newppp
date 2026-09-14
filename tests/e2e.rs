@@ -12,7 +12,7 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Once, OnceLock};
+use std::sync::{Arc, Once};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -35,7 +35,6 @@ use newppp::proto::frame::{FrameReader, FrameType, FrameWriter, PROTO_VERSION};
 use newppp::proto::mux::BoxStream;
 use newppp::server::fallback as srv_fallback;
 use newppp::server::wt as srv_wt;
-use wtransport::endpoint::endpoint_side::Client as WtClientSide;
 use wtransport::endpoint::ConnectOptions;
 use wtransport::ClientConfig as WtClientConfig;
 use wtransport::Endpoint;
@@ -1371,28 +1370,42 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
 
 /// Raw WT session request with a caller-chosen Authorization header
 /// (skip-verify, same tuning as the production client).
+///
+/// A fresh endpoint per call (not a process-global one): wtransport spawns the
+/// quinn driver on the *current* tokio runtime, so a shared endpoint created
+/// by one `#[tokio::test]` reports `EndpointStopping` for every other test
+/// once that test's runtime is dropped. The endpoint is kept alive on this
+/// runtime for as long as the returned connection.
 async fn raw_wt_connect(url: &str, auth: Option<String>) -> Result<wtransport::Connection> {
-    static EP: OnceLock<Endpoint<WtClientSide>> = OnceLock::new();
-    let ep = EP.get_or_init(|| {
-        use wtransport::tls::client::{build_default_tls_config, NoServerVerification};
-        let verifier: Option<Arc<dyn rustls::client::danger::ServerCertVerifier>> =
-            Some(Arc::new(NoServerVerification::new()));
-        let tls = build_default_tls_config(Arc::new(rustls::RootCertStore::empty()), verifier);
-        Endpoint::client(
-            WtClientConfig::builder()
-                .with_bind_default()
-                .with_custom_tls_and_transport(tls, newppp::quic_tune::tuned(2 * 1024 * 1024))
-                .build(),
-        )
-        .expect("wt client endpoint")
-    });
+    use wtransport::tls::client::{build_default_tls_config, NoServerVerification};
+    let verifier: Option<Arc<dyn rustls::client::danger::ServerCertVerifier>> =
+        Some(Arc::new(NoServerVerification::new()));
+    let tls = build_default_tls_config(Arc::new(rustls::RootCertStore::empty()), verifier);
+    let endpoint = Endpoint::client(
+        WtClientConfig::builder()
+            .with_bind_default()
+            .with_custom_tls_and_transport(tls, newppp::quic_tune::tuned(2 * 1024 * 1024))
+            .build(),
+    )
+    .expect("wt client endpoint");
+
     let mut opts = ConnectOptions::builder(url);
     if let Some(a) = auth {
         opts = opts.add_header("Authorization", a);
     }
-    timeout(HANDSHAKE, ep.connect(opts.build()))
+    let conn = timeout(HANDSHAKE, endpoint.connect(opts.build()))
         .await?
-        .map_err(|e| anyhow!("wt connect failed: {e}"))
+        .map_err(|e| anyhow!("wt connect failed: {e}"))?;
+
+    // Keep the endpoint (and its runtime-bound driver task) alive until the
+    // connection ends, then release both together.
+    let keep = conn.clone();
+    tokio::spawn(async move {
+        let _endpoint = endpoint;
+        let _ = keep.closed().await;
+    });
+
+    Ok(conn)
 }
 
 // ---------------------------------------------------------------------------
