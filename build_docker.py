@@ -159,13 +159,49 @@ def main() -> None:
 
     cmd = ["/newppp"]
     exposed = {"80/tcp": {}, "443/tcp": {}, "443/udp": {}}
+    # HEALTHCHECK 健康检查端口（scratch 镜像无 shell，必须调用二进制自身）；
+    # 探测走容器内 loopback，无需对外映射端口。
+    HEALTH_PORT = 9100
+    healthcheck = {
+        "Test": [
+            "/newppp",
+            "healthcheck",
+            "--url",
+            f"http://127.0.0.1:{HEALTH_PORT}/healthz",
+        ],
+        "Interval": 30_000_000_000,
+        "Timeout": 5_000_000_000,
+        "Retries": 3,
+        "StartPeriod": 0,
+    }
+    health_note = None
     if args.args:
         extra = shlex.split(args.args)
         if not extra or extra[0] not in ("-c", "-s"):
             raise SystemExit("--args 必须以 -c 或 -s 开头")
         cmd += extra
         exposed = {"1080/tcp": {}} if extra[0] == "-c" else exposed
+        # HEALTHCHECK 需要 --health 监听；烧参数时自动补上（若启动参数已带
+        # --health/--health=ADDR 则保留用户指定端口，同时更新探测 URL）。
+        health_addr = None
+        for i, a in enumerate(extra):
+            if a == "--health" and i + 1 < len(extra):
+                health_addr = extra[i + 1]
+            elif a.startswith("--health="):
+                health_addr = a.split("=", 1)[1]
+        if health_addr is None:
+            health_addr = f"127.0.0.1:{HEALTH_PORT}"
+            cmd += ["--health", health_addr]
+        healthcheck["Test"] = ["/newppp", "healthcheck", "--url", f"http://{health_addr}/healthz"]
+        print(f"已注入 HEALTHCHECK：/newppp healthcheck --url http://{health_addr}/healthz")
+        if health_addr != f"127.0.0.1:{HEALTH_PORT}":
+            print(f"  （探测地址已含用户指定 --health {health_addr}）")
         print(f"烧进镜像的启动参数: {' '.join(cmd)}")
+
+    if not args.args:
+        print()
+        print("  ⚠ 未烧启动参数：运行命令须自行包含 --health 127.0.0.1:9100，")
+        print("     否则镜像内置 HEALTHCHECK 会一直 unhealthy。")
 
     if not os.path.isfile(args.binary):
         raise SystemExit(f"找不到二进制文件: {args.binary}")
@@ -188,6 +224,7 @@ def main() -> None:
             "Cmd": cmd,
             "WorkingDir": "/",
             "ExposedPorts": exposed,
+            "Healthcheck": healthcheck,
         },
         "created": created,
         "rootfs": {"type": "layers", "diff_ids": [f"sha256:{layer_digest}"]},
@@ -252,7 +289,9 @@ def main() -> None:
     print("  5. 服务端正式部署挂载证书:")
     print("       -v /etc/newppp/certs:/certs  改用 --cert/--key，去掉 --self-signed")
     print("  6. --args 里的密码会写进镜像配置（docker inspect 可见），镜像")
-    print("     tar 请妥善保管。")
+    print("     tar 请妥善保管。更干净的做法（P2-2）：启动参数只烧")
+    print("     -c/-s --config /etc/newppp/newppp.conf，真实参数放挂载卷的")
+    print("     配置文件里（-v /etc/newppp:/etc/newppp），docker inspect 只见路径。")
     print()
     print("服务端示例（Cmd 为空时）:")
     print(f"  docker run -d -p 80:80 -p 443:443/tcp -p 443:443/udp {tag} -s \\")

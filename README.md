@@ -1,105 +1,117 @@
-﻿# newppp
+# newppp
 
-WebTransport (QUIC/HTTP-3) 代理。
+一个面向个人、家庭和小型团队的高性能加密代理。
 
-```
-客户端 (SOCKS5/HTTP 代理)                          服务端
-┌─────────────────────────┐        ┌──────────────────────────────┐
-│ socks5 :1080  http :8081│        │ UDP 443  WebTransport (h3)   │ ← 主路径
-│   └─ 连接池 (1..8 QUIC) │══QUIC══│ TCP 443  TLS POST 降级 (模式A)│
-│   └─ E2E: HKDF+ChaCha20 │        │ TCP 80   301→https + ACME    │
-└─────────────────────────┘        │ 内嵌伪装页 (nginx 欢迎页风格)   │
-                                   └──────────────┬───────────────┘
-                                                  ↓ dial
-                                             目标 TCP / UDP
-```
+newppp 将本地的 SOCKS5 或 HTTP 代理请求安全转发到远端服务器，适合远程办公、家庭网络访问、跨网络连接和受控的内网访问场景。
 
-UDP 443 与 TCP 443 可由**同一进程**监听（协议不同不冲突），单机即可承载全链路；生产档位 1 下 UDP 443 由 nginx stream 透传、TCP 443 由 nginx 终止（详见 `deploy/nginx.conf`）。
+## 核心功能
 
-三种部署形态：
+- **双入口**：支持标准 SOCKS5 代理和 HTTP 代理，可连接浏览器、命令行工具及常见网络应用。
+- **高速主通道**：优先使用 WebTransport/QUIC，连接建立快，并发连接多时仍能保持良好吞吐。
+- **自动备用通道**：主通道不可用时自动切换到 HTTPS 或 WebSocket，不需要手动重启客户端。
+- **TCP 与 UDP**：支持网页访问、长连接、DNS、实时通信等常见 TCP/UDP 流量。
+- **连接池**：客户端可维护多条远端连接，分散并发请求，降低单条连接拥堵的影响。
+- **断线自愈**：自动检测失效连接、重新连接，并在网络不稳定时暂时避开故障通道。
+- **访问保护**：服务端默认阻止回环地址、私有地址和云平台内网地址，降低开放代理和 SSRF 风险。
+- **灵活认证**：支持多用户账号、配置文件、本地代理认证，以及证书指纹绑定。
+- **轻量部署**：支持单进程运行、systemd、Docker、nginx 和 Cloudflare WebSocket 场景。
 
-* **形态 A（默认）**：UDP 443 WebTransport 主路径 + TCP 443 降级/伪装站 + 80 门面，性能最优。
-* **形态 B（纯网站）**：省略 `--listen` 完全不监听 UDP，流量收敛到 `/api/ppp`，探测面最小。
-* **形态 B-CF**：套 Cloudflare 橙云时改用 `wss://.../api/ppp`（WebSocket 承载，CF 不透传 QUIC/WebTransport）。
+## 性能特点
+
+- WebTransport/QUIC 适合高延迟和多并发网络，避免所有请求挤在一条 TCP 连接上。
+- UDP 小数据包优先使用低延迟通道，超过路径容量时自动改走可靠流，减少大包失败。
+- 帧处理采用 ChaCha20-Poly1305 加密，并复用编码缓冲区，降低频繁分配带来的开销。
+- 服务端支持按用户共享的带宽限制，避免单个账号占满全部出口带宽。
+- 支持配置连接数量、接收窗口、会话数量和空闲回收时间，可按网络质量调整。
+
+性能会受到网络延迟、丢包率、服务器带宽和目标站点影响。项目提供本地 benchmark，用于比较帧加密和编解码性能，不能替代真实网络环境测试。
+
+## 安全特点
+
+- 代理数据使用加密通道保护，传输链路上的中间网络无法直接读取代理内容；服务端需要解密数据后才能完成转发，因此服务端本身属于受信任边界。
+- 账号认证使用时间窗口和随机 nonce，重复使用的认证材料会被拒绝。
+- TLS 证书默认进行正常校验，也支持使用 SHA-256 证书指纹固定服务器身份。
+- 服务端默认拒绝访问本机、私网、链路本地和特殊保留地址。
+- `--skip-verify` 和 `--self-signed` 仅适合开发或本地测试，生产环境应使用正式证书。
+
+注意：账号密码是内层密钥的重要组成部分，请使用足够长且随机的密码。
+推荐64位大小写字母数字混合密码
 
 ## 快速开始
 
-```bash
-# 服务端（单进程全链路，自签调试）
-newppp -s --auth alice:secret123 --self-signed \
-  --listen          0.0.0.0:443 \
-  --fallback-listen 0.0.0.0:443 \
-  --http-listen     0.0.0.0:80
+### 服务端
 
-# 客户端
-newppp -c --auth alice:secret123 \
+下面示例使用自签名证书，适合本地测试。生产环境请改用 `--cert` 和 `--key`。
+
+```bash
+newppp -s --auth alice:CHANGE_THIS_PASSWORD --self-signed \
+  --listen 0.0.0.0:443 \
+  --fallback-listen 0.0.0.0:443 \
+  --http-listen 0.0.0.0:80
+```
+
+### 客户端
+
+```bash
+newppp -c --auth alice:CHANGE_THIS_PASSWORD \
   --server https://your.domain:443 \
   --url https://your.domain/api/ppp \
-  --bind 127.0.0.1:1080 --http-bind 127.0.0.1:8081
+  --bind 127.0.0.1:1080 \
+  --http-bind 127.0.0.1:8081
 ```
 
-完整参数、形态切换与验证命令见 [docs/手册.md](docs/手册.md)。
+自签名测试时，客户端加上 `--skip-verify`。启动后即可使用：
 
-## 文档导航
+```bash
+curl --socks5-hostname 127.0.0.1:1080 https://example.com
+curl -x http://127.0.0.1:8081 https://example.com
+```
 
-本仓库文档分为「根目录简介 + docs 专题」，各文档路径与职责如下：
+示例配置：
+
+- 服务端：`deploy/server.example.conf`
+- 客户端：`deploy/client.example.conf`
+
+## 部署选择
+
+| 场景 | 推荐方式 |
+| --- | --- |
+| 追求速度和 UDP 能力 | WebTransport 主通道 + HTTPS 备用通道 |
+| 只开放网站端口 | 仅使用 HTTPS 备用通道，省略服务端 `--listen` |
+| 使用 Cloudflare 代理 | 使用 `wss://.../api/ppp` 作为备用通道 |
+| 家庭或 NAS 使用 | 客户端绑定 `0.0.0.0`，同时开启 `--inbound-auth` |
+| 生产服务器 | 正式证书 + systemd 或 Docker + 健康检查 |
+
+## 配置文件
+
+长命令可以放入配置文件：
+
+```bash
+newppp --config /etc/newppp/server.conf
+```
+
+配置文件支持 `mode`、`auth`、监听地址、证书、连接限制和日志等长选项。配置文件中的密码请设置为仅管理员可读；项目会在权限过宽时给出警告。
+
+## 文档
 
 | 文档 | 内容 |
-|---|---|
-| [docs/手册.md](docs/手册.md) | 使用手册：部署形态（A / B / B-CF）、快速开始、服务端/客户端参数、验证 |
-| [docs/运维手册.md](docs/运维手册.md) | 生产部署（systemd / screen / nginx / Cloudflare）、Docker 打包、服务端出站安全策略、已知限制/风险、构建与质量门 |
-| [docs/协议文档.md](docs/协议文档.md) | 协议基线：架构与降级链、帧协议、加密与认证、内部时钟、会话生命周期、背压与容量、隐私与安全模型、性能 |
-| [docs/变更记录.md](docs/变更记录.md) | 版本变更与修复历史 |
-| [docs/待办_新.md](docs/待办_新.md) | 当前路线图、优先级与待办 |
-| [docs/待办_废弃.md](docs/待办_废弃.md) | 已完成 / 废弃待办的归档 |
-| [docs/RUST审查.md](docs/RUST审查.md) | Rust 代码审查清单与规范 |
+| --- | --- |
+| [docs/手册.md](docs/手册.md) | 安装、启动、参数、配置文件和常用使用方式 |
+| [docs/运维手册.md](docs/运维手册.md) | systemd、Docker、nginx、Cloudflare、健康检查和故障排查 |
+| [docs/协议文档.md](docs/协议文档.md) | 通道、认证、加密、连接生命周期和安全模型 |
+| [docs/变更记录.md](docs/变更记录.md) | 功能变更和历史修复记录 |
+| [docs/待办_新.md](docs/待办_新.md) | 当前路线图和后续计划 |
+| [docs/报告/RUST审查报告.md](docs/报告/RUST审查报告.md) | Rust 代码审查结果 |
+| [docs/报告/文档审查报告.md](docs/报告/文档审查报告.md) | 文档与代码一致性审核结果 |
 
-> 路径引用约定：根目录 `README.md` 只保留项目简介与导航，正文内容已拆分至 `docs/`。正文中提及文档时使用**相对仓库根**的路径（如 `docs/手册.md`）；`docs/` 内文档互相引用使用同目录相对路径（如 `手册.md`），回指根简介使用 `../README.md`。
-
-## 目录结构
-
-```
-src/
-├── main.rs            # 入口：-c/-s 分发（薄封装，调用 lib）
-├── lib.rs             # 库入口（供 bench/集成测试复用）
-├── config.rs          # CLI 与运行时配置
-├── clock.rs           # 内部 UTC 时钟：HTTP Date 头校准（--time），认证时间戳来源
-├── quic_tune.rs       # 共享 QUIC 传输调优（可调窗口 + BBR 拥塞控制）
-├── proto/             # 共享协议层
-│   ├── frame.rs       #   帧编解码（头/AAD/计数器/滑动窗口/异步读写器/坏帧恢复）
-│   ├── crypto.rs      #   HKDF 派生、ChaCha20-Poly1305、Bearer/AUTH、防重放
-│   ├── addr.rs        #   UDP 地址编码（内部 LE / SOCKS5 边界 BE）
-│   ├── mux.rs         #   模式 A 多路复用器（客户端角色 + 服务端角色 + FrameSink）
-│   └── stream.rs      #   字节流 → AsyncRead 桥接（POST body / WS 消息共用）
-├── client/
-│   ├── outbound.rs    #   出口选择、熔断器与自动降级
-│   ├── wt.rs          #   WebTransport 连接池/控制流/专用流/datagram
-│   ├── fallback.rs    #   HTTPS POST 降级出口（hyper + rustls）
-│   ├── socks5.rs      #   SOCKS5 入站（CONNECT / UDP ASSOCIATE）
-│   └── http_proxy.rs  #   HTTP 代理入站（CONNECT + 简单转发）
-└── server/
-    ├── wt.rs          #   WebTransport 监听/认证/控制流/datagram/专用流
-    ├── fallback.rs    #   axum 降级端点（POST + WebSocket）+ 伪装站 + 80 重定向/ACME
-    ├── hub.rs         #   TCP 拨号/双向泵/UDP 中继（两传输共用）
-    ├── state.rs       #   全局与连接状态、会话表、空闲回收（配额恰好一次释放）
-    ├── limit.rs       #   令牌桶限速
-    └── disguise.rs    #   内嵌伪装页（nginx 欢迎页风格）
-benches/
-└── frame.rs           # 帧热路径 criterion 基准（AEAD / encode / decode）
-tests/
-└── e2e.rs             # 进程内端到端测试：真实 server+client（降级链/认证/半关闭/UDP/生命周期，10 项）
-.github/
-└── workflows/ci.yml   # CI 单文件：fmt / clippy / test + 每周 audit + tag 出 musl artifact
-```
-
-## 构建
+## 构建与测试
 
 ```bash
 cargo build --release
-cargo test            # 61 项单元/property 测试 + 10 项进程内端到端（tests/e2e.rs）
+cargo test --all-features
 ```
 
-完整质量门（fmt / clippy / test / CI）见 [docs/运维手册.md](docs/运维手册.md#构建与质量门)；CI 配置见 [.github/workflows/ci.yml](.github/workflows/ci.yml)。
+Windows 发布构建使用 `build_release.bat`；Linux 静态构建使用 `build_linux.bat`。完整质量检查和 Docker 打包流程见 [docs/运维手册.md](docs/运维手册.md)。
 
 ## 许可
 

@@ -21,7 +21,13 @@ ExecStart=/usr/local/bin/newppp -s \
   --max-sessions 200 \
   --rate 100 \
   --idle 60 \
+  --health 127.0.0.1:9100 \
   --log info
+# 优雅停机（P3-1/P3-5）：SIGTERM 交给 newppp，按 --shutdown-grace（默认 10s）
+# 排空在途会话后以退出码 0 退出；Restart=on-failure 不会把正常停机误判为崩溃。
+# TimeoutStopSec 需 > --shutdown-grace，留足 systemd 强杀前的余量。
+KillSignal=SIGTERM
+TimeoutStopSec=15
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=65536

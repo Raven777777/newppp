@@ -208,6 +208,11 @@ impl MuxInner {
         self.closed.cancel();
         self.sessions.clear();
         self.udp.clear();
+        // Fail fast: dropping the oneshot senders makes pending open/UDP
+        // waiters error out immediately instead of hanging out the full
+        // HANDSHAKE_TIMEOUT on a channel that is already dead.
+        self.pending_open.clear();
+        self.pending_udp.clear();
     }
 }
 
@@ -288,6 +293,7 @@ impl MuxClient {
             .is_err()
         {
             self.inner.sessions.remove(&sid);
+            self.inner.pending_open.remove(&sid);
             anyhow::bail!("mux channel closed");
         }
 
@@ -367,12 +373,17 @@ impl MuxClient {
             .is_err()
         {
             self.inner.udp.remove(&sid);
+            self.inner.pending_udp.remove(&sid);
             anyhow::bail!("mux channel closed");
         }
         let reply = match timeout(HANDSHAKE_TIMEOUT, orx).await {
             Ok(Ok(r)) => r,
             _ => {
                 self.inner.udp.remove(&sid);
+                // Also drop the pending entry: leaving the oneshot sender
+                // here would leak it (the reply, if it ever arrives, has no
+                // waiter to reach).
+                self.inner.pending_udp.remove(&sid);
                 anyhow::bail!("udp_associate: no reply");
             }
         };
@@ -453,7 +464,11 @@ async fn handle_client_frame(inner: &Arc<MuxInner>, f: super::frame::Frame) -> b
         }
         FrameType::OpenErr => {
             let e = code_to_open_error(&f.payload);
+            // A failed UDP associate is reported with OpenErr too, so the
+            // waiter may live in either map (sids are unique per connection).
             if let Some((_, tx)) = inner.pending_open.remove(&f.sid) {
+                let _ = tx.send(Err(e));
+            } else if let Some((_, tx)) = inner.pending_udp.remove(&f.sid) {
                 let _ = tx.send(Err(e));
             }
             false
@@ -466,7 +481,11 @@ async fn handle_client_frame(inner: &Arc<MuxInner>, f: super::frame::Frame) -> b
         }
         FrameType::Error => {
             let e = code_to_open_error(&f.payload);
-            if let Some((_, tx)) = inner.pending_udp.remove(&f.sid) {
+            // Resolve whichever open/associate is pending for this sid before
+            // dropping the session route.
+            if let Some((_, tx)) = inner.pending_open.remove(&f.sid) {
+                let _ = tx.send(Err(e));
+            } else if let Some((_, tx)) = inner.pending_udp.remove(&f.sid) {
                 let _ = tx.send(Err(e));
             }
             inner.sessions.remove(&f.sid);
@@ -749,6 +768,43 @@ mod tests {
         assert!(!handle_client_frame(&inner, data_frame(0, 7, b"chunk")).await);
         assert_eq!(rx.recv().await.as_deref(), Some(&b"chunk"[..]));
         assert!(inner.sessions.get(&7).is_some());
+    }
+
+    fn open_err_frame(code: u8, sid: u32) -> Frame {
+        Frame {
+            ftype: FrameType::OpenErr,
+            flags: 0,
+            sid,
+            counter: 0,
+            aad: [0u8; 12],
+            payload: vec![code],
+        }
+    }
+
+    /// A server-side UDP-associate failure is delivered as an `OpenErr`; the
+    /// mode-A client must wake the UDP waiter (not only the TCP one),
+    /// otherwise the call hangs until `HANDSHAKE_TIMEOUT`.
+    #[tokio::test]
+    async fn client_open_err_resolves_pending_udp_associate() {
+        let inner = test_inner();
+        let (os, orx) = oneshot::channel();
+        inner.pending_udp.insert(9, os);
+
+        assert!(!handle_client_frame(&inner, open_err_frame(OPEN_ERR_LIMIT, 9)).await);
+        assert_eq!(orx.await.expect("waiter woken"), Err(OpenError::Limit));
+        assert!(inner.pending_udp.get(&9).is_none());
+    }
+
+    /// The same frame type still resolves a pending TCP open.
+    #[tokio::test]
+    async fn client_open_err_resolves_pending_tcp_open() {
+        let inner = test_inner();
+        let (os, orx) = oneshot::channel();
+        inner.pending_open.insert(3, os);
+
+        assert!(!handle_client_frame(&inner, open_err_frame(OPEN_ERR_DIAL, 3)).await);
+        assert_eq!(orx.await.expect("waiter woken"), Err(OpenError::DialFailed));
+        assert!(inner.pending_open.get(&3).is_none());
     }
 
     #[derive(Default)]

@@ -119,7 +119,9 @@ pub fn is_public_target(addr: std::net::SocketAddr) -> bool {
                 && !ip.is_broadcast()
                 && {
                     let o = ip.octets();
-                    !(o[0] == 100 && (64..=127).contains(&o[1]))
+                    o[0] != 0 // 0.0.0.0/8 "this network"
+                        && o[0] & 0xf0 != 0xf0 // 240.0.0.0/4 reserved (incl. 255/32)
+                        && !(o[0] == 100 && (64..=127).contains(&o[1]))
                         && !(o[0] == 192 && o[1] == 0 && o[2] == 0)
                         && !(o[0] == 192 && o[1] == 0 && o[2] == 2)
                         && !(o[0] == 198 && o[1] == 18)
@@ -147,6 +149,8 @@ pub fn is_public_target(addr: std::net::SocketAddr) -> bool {
                 && !ip.is_multicast()
                 && !(segments[0] & 0xfe00 == 0xfc00)
                 && !(segments[0] & 0xffc0 == 0xfe80)
+                // 2001:db8::/32 — documentation-only, never routable
+                && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
         }
     }
 }
@@ -312,6 +316,7 @@ impl ServerHooks for Hooks {
                 "udp_feed: sending {} bytes to {addr} (sid={sid})",
                 data.len()
             );
+            conn.rate.acquire(data.len()).await;
             let _ = sock.send_to(&data, addr).await;
         })
     }
@@ -369,6 +374,7 @@ fn spawn_udp_recv(
                     match r {
                         Ok((n, src)) => {
                             conn.touch(sid);
+                            conn.rate.acquire(n).await;
                             let mut payload = Vec::with_capacity(24 + n);
                             match src {
                                 std::net::SocketAddr::V4(a) => UdpAddr::V4(a).encode(&mut payload),
@@ -408,12 +414,14 @@ pub fn spawn_tcp_pumps(
     // client -> target
     // Note: this pump never drops the session — a client FIN here is a
     // half-close and the target -> client pump owns the teardown/release.
+    let conn_in = conn.clone();
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = token.cancelled() => break,
                 m = rx.recv() => {
                     if let Some((data, fin)) = m {
+                        conn_in.rate.acquire(data.len()).await;
                         if wr.write_all(&data).await.is_err() {
                             break;
                         }
@@ -598,6 +606,7 @@ pub async fn handle_wt_stream(
                             Ok(Some(f)) => match f.ftype {
                                 FrameType::Data => {
                                     conn2.touch(sid);
+                                    conn2.rate.acquire(f.payload.len()).await;
                                     if sock_wr.write_all(&f.payload).await.is_err() {
                                         break;
                                     }
@@ -650,6 +659,7 @@ mod tests {
             active_sessions: AtomicU64::new(0),
             max_sessions: 10,
             rate_mbps: 0,
+            rates: DashMap::new(),
             idle: Duration::from_secs(60),
             allow_private_targets: false,
             unauth: Arc::new(crate::server::limit::UnauthGate::new(128, 16)),
@@ -662,7 +672,7 @@ mod tests {
             uid: "u".into(),
             cipher: Arc::new(FrameCipher::new(&[0u8; 32])),
             stream_counters: crate::proto::crypto::CounterGen::stream_server(),
-            rate: RateLimiter::new(0),
+            rate: Arc::new(RateLimiter::new(0)),
             cancel: CancellationToken::new(),
             sessions: Default::default(),
             tcp_routes: Default::default(),
@@ -750,9 +760,13 @@ mod tests {
             "169.254.169.254:80",
             "100.64.0.1:80",
             "192.0.2.1:80",
+            "0.1.2.3:80",
+            "240.0.0.1:80",
+            "255.255.255.255:80",
             "[::1]:80",
             "[fc00::1]:80",
             "[fe80::1]:80",
+            "[2001:db8::1]:80",
             "[::ffff:127.0.0.1]:80",
         ] {
             assert!(!is_public_target(target.parse().unwrap()), "{target}");

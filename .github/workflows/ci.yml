@@ -25,6 +25,10 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-features --all-targets -- -D warnings
       - run: cargo test --all-features
+      - run: cargo test --release --all-features
+        # debug 下 debug_assert! 的条件表达式会被求值、release 下被裁剪：
+        # 曾掩盖"会话注册副作用被裁剪"P0 bug（6 个 release-only 测试失败），
+        # 因此 release 测试必须常驻 CI 防线。
 
   audit:
     # Weekly dependency audit (cargo-audit).

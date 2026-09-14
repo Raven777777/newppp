@@ -39,6 +39,7 @@ pub fn build_state(cfg: &ServerConfig) -> Arc<ServerState> {
         active_sessions: AtomicU64::new(0),
         max_sessions: cfg.max_sessions,
         rate_mbps: cfg.rate_mbps,
+        rates: DashMap::new(),
         idle: Duration::from_secs(cfg.idle_secs),
         allow_private_targets: cfg.allow_private_targets,
         unauth: Arc::new(limit::UnauthGate::new(
@@ -52,12 +53,73 @@ pub fn build_state(cfg: &ServerConfig) -> Arc<ServerState> {
 }
 
 pub async fn run(cfg: ServerConfig) -> Result<()> {
+    let token = tokio_util::sync::CancellationToken::new();
+    {
+        let t = token.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            info!("shutdown signal received");
+            t.cancel();
+        });
+    }
+    run_with_shutdown(cfg, token).await
+}
+
+/// Run the server until `token` is cancelled (SIGINT/SIGTERM in `run`, tests
+/// pass their own), then shut down gracefully:
+///
+/// 1. stop handling new connections (cancel live connection tokens — their
+///    watchers close the QUIC transport with CONNECTION_CLOSE and session
+///    tokens are children, so pumps unroll quickly);
+/// 2. drain in-flight sessions up to `--shutdown-grace` (default 10s), then
+///    force-close whatever is left;
+/// 3. abort the listener tasks and drop their handles.
+///
+/// The teardown timing is the proven sequence from `tests/e2e.rs`
+/// (`TestServer::shutdown`): cancelling before aborting the listeners is what
+/// releases the QUIC endpoint driver (and its UDP socket) immediately — an
+/// accept-loop abort alone leaves per-connection tasks holding `Connection`
+/// clones and the port stranding for seconds. Returns Ok(()) so supervision
+/// (systemd `Restart=on-failure`, docker `Restart=always`) sees exit code 0
+/// and does not enter a restart loop.
+pub async fn run_with_shutdown(
+    cfg: ServerConfig,
+    token: tokio_util::sync::CancellationToken,
+) -> Result<()> {
     let st = build_state(&cfg);
     for u in st.static_keys.keys() {
         info!("user '{u}' registered");
     }
 
-    tokio::spawn(reaper_loop(st.clone()));
+    let shutdown_grace = Duration::from_secs(cfg.shutdown_grace);
+    tokio::spawn(reaper_loop(st.clone(), token.clone()));
+    let transport: &'static str = match (
+        cfg.listen.is_some(),
+        cfg.fallback_listen.is_some() || cfg.http_listen.is_some(),
+    ) {
+        (true, true) => "mixed",
+        (true, false) => "wt",
+        (false, true) => "fallback",
+        (false, false) => "none",
+    };
+
+    let health_task = match &cfg.health {
+        Some(addr) => Some(
+            crate::health::spawn(
+                addr,
+                Arc::new(crate::health::Health::new(
+                    std::time::Instant::now(),
+                    crate::health::Source::Server {
+                        st: st.clone(),
+                        transport,
+                    },
+                )),
+                "server",
+            )
+            .await?,
+        ),
+        None => None,
+    };
 
     let tls = setup_tls(cfg.cert).await.context("TLS setup")?;
 
@@ -91,20 +153,65 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
     }
 
     info!(
-        "newppp server started (max_sessions={}, rate={}Mbps, idle={}s)",
-        cfg.max_sessions, cfg.rate_mbps, cfg.idle_secs
+        "newppp server started (max_sessions={}, rate={}Mbps, idle={}s, shutdown_grace={}s)",
+        cfg.max_sessions, cfg.rate_mbps, cfg.idle_secs, cfg.shutdown_grace
     );
 
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            info!("shutdown signal received");
-        }
+        _ = token.cancelled() => {}
         _ = wait_any(&mut tasks) => {
             warn!("a listener exited; shutting down");
         }
     }
-    tasks.abort_all();
+    graceful_shutdown(&st, &mut tasks, shutdown_grace, &token).await;
+    if let Some(t) = health_task {
+        t.abort();
+        let _ = t.await;
+    }
     Ok(())
+}
+
+/// P3-1 teardown: cancel live connections → drain bounded by the grace
+/// period → drop listener handles. See `run_with_shutdown` for the rationale.
+async fn graceful_shutdown(
+    st: &Arc<ServerState>,
+    tasks: &mut tokio::task::JoinSet<Result<()>>,
+    grace: Duration,
+    token: &tokio_util::sync::CancellationToken,
+) {
+    let tokens: Vec<tokio_util::sync::CancellationToken> = st
+        .conns
+        .iter()
+        .filter(|c| !c.value().cancel.is_cancelled())
+        .map(|c| c.value().cancel.clone())
+        .collect();
+    info!(
+        "graceful shutdown: closing {} live connection(s), draining up to {grace:?}",
+        tokens.len()
+    );
+    for t in tokens {
+        t.cancel();
+    }
+    let deadline = tokio::time::Instant::now() + grace;
+    while st
+        .active_sessions
+        .load(std::sync::atomic::Ordering::Relaxed)
+        != 0
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let left = st
+        .active_sessions
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if left > 0 {
+        warn!("drain timeout after {grace:?}: {left} in-flight session(s) force-closed");
+    } else {
+        info!("graceful shutdown: drain complete");
+    }
+    st.sweep_conns();
+    token.cancel();
+    tasks.abort_all();
 }
 
 /// Resolve as soon as any listener task finishes (success or failure).
@@ -118,10 +225,13 @@ async fn wait_any(tasks: &mut tokio::task::JoinSet<Result<()>>) {
     }
 }
 
-async fn reaper_loop(st: Arc<ServerState>) {
+async fn reaper_loop(st: Arc<ServerState>, token: tokio_util::sync::CancellationToken) {
     let mut iv = tokio::time::interval(Duration::from_secs(10));
     loop {
-        iv.tick().await;
+        tokio::select! {
+            _ = token.cancelled() => return,
+            _ = iv.tick() => {}
+        }
         st.reap_idle();
         st.sweep_conns();
     }
@@ -267,6 +377,7 @@ mod tests {
             active_sessions: AtomicU64::new(0),
             max_sessions: 10,
             rate_mbps: 0,
+            rates: DashMap::new(),
             idle: Duration::from_secs(60),
             allow_private_targets: false,
             unauth: Arc::new(limit::UnauthGate::new(128, 16)),

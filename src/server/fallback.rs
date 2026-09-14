@@ -38,7 +38,6 @@ use crate::proto::frame::{FrameEncoder, FrameReader, FrameType};
 use crate::proto::mux::{run_server_mux, FrameSink, OutFrame};
 use crate::proto::stream::StreamAsRead;
 use crate::server::hub::Hooks;
-use crate::server::limit::RateLimiter;
 use crate::server::state::{ConnState, ServerState};
 
 pub fn router(st: Arc<ServerState>) -> Router {
@@ -234,12 +233,13 @@ fn spawn_mode_a_channel<R>(
 
     let conn_id = st.conn_seq.fetch_add(1, Ordering::Relaxed);
     let cancel = CancellationToken::new();
+    let rate = st.rate_for(&uid);
     let conn = Arc::new(ConnState {
         id: conn_id,
         uid,
         cipher: cipher.clone(),
         stream_counters: CounterGen::stream_server(),
-        rate: RateLimiter::new(st.rate_mbps),
+        rate,
         cancel: cancel.clone(),
         sessions: Default::default(),
         tcp_routes: Default::default(),

@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use tokio::sync::mpsc;
@@ -42,11 +42,15 @@ impl SessionHandle {
     }
 }
 
+/// Monotonic milliseconds since the first call (process-relative uptime).
+///
+/// Idle/liveness tracking must not be perturbed by wall-clock (NTP) jumps, so
+/// this deliberately uses `Instant`, not `SystemTime`. Callers only ever
+/// compare two values from this function; absolute wall time is never needed
+/// in this module (the `/healthz` timestamp uses its own wall clock).
 pub fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    BASE.get_or_init(Instant::now).elapsed().as_millis() as i64
 }
 
 /// State for one authenticated remote connection (one user session).
@@ -55,7 +59,10 @@ pub struct ConnState {
     pub uid: String,
     pub cipher: Arc<FrameCipher>,
     pub stream_counters: CounterGen,
-    pub rate: RateLimiter,
+    /// Shared (per-uid) egress+ingress limiter: all of a user's connections
+    /// draw from the same bucket, so the `--rate` cap is per-user, not
+    /// per-connection.
+    pub rate: Arc<RateLimiter>,
     pub cancel: CancellationToken,
     pub sessions: DashMap<u32, Arc<SessionHandle>>,
     /// mux-path TCP routing: sid -> inbound data queue
@@ -75,10 +82,9 @@ impl ConnState {
     /// and its global quota released.
     pub fn register(&self, sid: u32) -> CancellationToken {
         let token = self.cancel.child_token();
-        debug_assert!(
-            self.try_register_with(sid, token.clone()).is_some(),
-            "session sid {sid} already registered"
-        );
+        let registered = self.try_register_with(sid, token.clone());
+        debug_assert!(registered.is_some(), "session sid {sid} already registered");
+        drop(registered);
         token
     }
 
@@ -171,6 +177,8 @@ pub struct ServerState {
     pub active_sessions: AtomicU64,
     pub max_sessions: usize,
     pub rate_mbps: u64,
+    /// uid -> shared token bucket (`rate_for` is the only accessor).
+    pub rates: DashMap<String, Arc<RateLimiter>>,
     pub idle: Duration,
     pub allow_private_targets: bool,
     /// Cap on concurrent connections that have not completed in-band AUTH yet.
@@ -182,6 +190,15 @@ pub struct ServerState {
 }
 
 impl ServerState {
+    /// Return (creating on first use) the per-uid rate limiter so every
+    /// connection of the same user shares one bucket.
+    pub fn rate_for(&self, uid: &str) -> Arc<RateLimiter> {
+        self.rates
+            .entry(uid.to_owned())
+            .or_insert_with(|| Arc::new(RateLimiter::new(self.rate_mbps)))
+            .clone()
+    }
+
     pub fn try_acquire_session(&self) -> bool {
         loop {
             let cur = self.active_sessions.load(Ordering::Relaxed);
@@ -295,6 +312,7 @@ mod tests {
             seen_nonces: DashMap::new(),
             nonce_lock: std::sync::Mutex::new(()),
             path: "/api/ppp".into(),
+            rates: DashMap::new(),
         }
     }
 
@@ -304,7 +322,7 @@ mod tests {
             uid: "u".into(),
             cipher: Arc::new(FrameCipher::new(&[0u8; 32])),
             stream_counters: CounterGen::stream_server(),
-            rate: RateLimiter::new(0),
+            rate: Arc::new(RateLimiter::new(0)),
             cancel: CancellationToken::new(),
             sessions: Default::default(),
             tcp_routes: Default::default(),
@@ -411,5 +429,18 @@ mod tests {
         let st = test_state();
         assert!(st.check_and_remember_nonce("u", &[1u8; 16], 1000));
         assert!(!st.check_and_remember_nonce("u", &[1u8; 16], 1000));
+    }
+
+    /// All connections of one user share a single bucket (`--rate` is a
+    /// per-user cap); different users get independent buckets.
+    #[test]
+    fn rate_for_shares_one_bucket_per_uid() {
+        let st = test_state();
+        let a1 = st.rate_for("alice");
+        let a2 = st.rate_for("alice");
+        let b = st.rate_for("bob");
+        assert!(Arc::ptr_eq(&a1, &a2));
+        assert!(!Arc::ptr_eq(&a1, &b));
+        assert_eq!(st.rates.len(), 2);
     }
 }

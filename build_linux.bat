@@ -2,6 +2,14 @@
 setlocal
 
 cd /d "%~dp0"
+
+rem Portable release optimization: keep the artifact runnable on generic x86_64
+rem Linux hosts; do not use target-cpu=native for distributable binaries.
+set "CARGO_PROFILE_RELEASE_OPT_LEVEL=3"
+set "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1"
+set "CARGO_PROFILE_RELEASE_LTO=thin"
+set "CARGO_PROFILE_RELEASE_STRIP=true"
+
 set "TARGET=x86_64-unknown-linux-musl"
 set "OUTPUT=%~dp0target\%TARGET%\release\newppp"
 

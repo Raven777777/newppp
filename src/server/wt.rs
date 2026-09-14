@@ -16,7 +16,6 @@ use crate::proto::frame::{
 };
 use crate::proto::mux::{FrameSink, OutFrame, ServerHooks};
 use crate::server::hub::{handle_wt_stream, Hooks};
-use crate::server::limit::RateLimiter;
 use crate::server::state::{ConnState, ServerState};
 
 pub const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -39,14 +38,15 @@ pub async fn run_wt(
         let incoming = endpoint.accept().await;
         let st = st.clone();
         let remote = incoming.remote_address();
+        // Unauthenticated-connection gate (D1): reject before spawning so a
+        // connection flood does not churn a task per attempt. The guard is
+        // held until the in-band AUTH frame verifies, then released so
+        // authenticated sessions are not throttled by it.
+        let Some(guard) = st.unauth.try_admit(Some(remote.ip())) else {
+            debug!("refusing connection from {remote}: unauthenticated cap reached");
+            continue;
+        };
         tokio::spawn(async move {
-            // Unauthenticated-connection gate (D1): held until the in-band
-            // AUTH frame verifies, then released so authenticated sessions
-            // are not throttled by it.
-            let Some(guard) = st.unauth.try_admit(Some(remote.ip())) else {
-                debug!("refusing connection from {remote}: unauthenticated cap reached");
-                return;
-            };
             let request = match incoming.await {
                 Ok(r) => r,
                 Err(e) => {
@@ -133,12 +133,13 @@ async fn handle_wt_conn(
         .conn_seq
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let cancel = CancellationToken::new();
+    let rate = st.rate_for(&uid);
     let conn_state = Arc::new(ConnState {
         id: conn_id,
         uid,
         cipher: cipher.clone(),
         stream_counters: stream_counters.clone(),
-        rate: RateLimiter::new(st.rate_mbps),
+        rate,
         cancel: cancel.clone(),
         sessions: Default::default(),
         tcp_routes: Default::default(),

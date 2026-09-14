@@ -254,12 +254,12 @@ pub fn verify_bearer_parts(
     expected_uid: &str,
     window: u64,
 ) -> Option<(u64, [u8; SALT_LEN])> {
-    let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() != 4 || parts[0] != expected_uid {
+    let mut parts = token.split('.');
+    if parts.next() != Some(expected_uid) {
         return None;
     }
-    let ts: u64 = parts[1].parse().ok()?;
-    let nonce = match unhex(parts[2]) {
+    let ts: u64 = parts.next()?.parse().ok()?;
+    let nonce = match unhex(parts.next()?) {
         Some(v) if v.len() == SALT_LEN => {
             let mut n = [0u8; SALT_LEN];
             n.copy_from_slice(&v);
@@ -267,7 +267,7 @@ pub fn verify_bearer_parts(
         }
         _ => return None,
     };
-    let mac = match unhex(parts[3]) {
+    let mac = match unhex(parts.next()?) {
         Some(v) if v.len() == MAC_LEN => {
             let mut m = [0u8; MAC_LEN];
             m.copy_from_slice(&v);
@@ -275,6 +275,10 @@ pub fn verify_bearer_parts(
         }
         _ => return None,
     };
+    // Reject tokens with trailing segments (`uid.ts.nonce.mac.extra`).
+    if parts.next().is_some() {
+        return None;
+    }
     let now = now_unix();
     // saturating: `ts` is attacker-controlled and must not overflow
     if now.saturating_sub(ts) > window || ts.saturating_sub(now) > window {

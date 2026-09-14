@@ -30,11 +30,12 @@ use tokio_tungstenite::Connector;
 use tracing::debug;
 use {futures_util::SinkExt, futures_util::StreamExt};
 
+use crate::client::tls::HyperFixedResolver;
 use crate::config::ClientConfig;
 use crate::proto::crypto::{
     auth_mac, derive_session_key, make_bearer, AuthPayload, CounterGen, FrameCipher, SALT_LEN,
 };
-use crate::proto::frame::{FrameEncoder, FrameType};
+use crate::proto::frame::{random_padding, FrameEncoder, FrameType};
 use crate::proto::mux::{BoxStream, MuxClient, UdpPipe};
 use crate::proto::stream::StreamAsRead;
 use crate::proto::USER_AGENT;
@@ -53,16 +54,43 @@ pub struct HttpOutbound {
 }
 
 impl HttpOutbound {
-    pub fn new(cfg: &ClientConfig, url: &str) -> Result<HttpOutbound> {
+    pub async fn new(cfg: &ClientConfig, url: &str) -> Result<HttpOutbound> {
         let static_key = crate::proto::crypto::derive_static_key(&cfg.password, &cfg.uid);
         let ws = url.starts_with("wss://") || url.starts_with("ws://");
+        // `--sni` masquerade: the URL host is rewritten to the masquerade
+        // name (driving TLS SNI and the HTTP Host/`:authority`), and a
+        // fixed-address hyper resolver points the connection at the real
+        // server address from the original URL. wss is rejected at config
+        // validation (CF routes by real SNI), so masquerade is POST-only.
+        let (dial_url, _sni_name) = match &cfg.sni {
+            Some(sni) => {
+                let mut u = url::Url::parse(url).map_err(|e| anyhow!("bad --url: {e}"))?;
+                u.set_host(Some(sni))
+                    .map_err(|_| anyhow!("--sni '{sni}' cannot replace the URL host"))?;
+                (u.to_string(), Some(sni.clone()))
+            }
+            None => (url.to_string(), None),
+        };
+        let resolver = match &cfg.sni {
+            Some(_) => {
+                let (addr, _port) = super::wt::url_host_and_port(url).await?;
+                Some(HyperFixedResolver::new(addr))
+            }
+            None => None,
+        };
         let (client, ws_tls) = if ws {
-            (None, Some(Arc::new(build_ws_tls(cfg.skip_verify)?)))
+            (
+                None,
+                Some(Arc::new(build_ws_tls(cfg.skip_verify, cfg.pin)?)),
+            )
         } else {
-            (Some(build_client(cfg.skip_verify)?), None)
+            (
+                Some(build_client(cfg.skip_verify, cfg.pin, resolver)?),
+                None,
+            )
         };
         Ok(HttpOutbound {
-            url: url.to_string(),
+            url: dial_url,
             ws,
             static_key,
             uid: cfg.uid.clone(),
@@ -114,13 +142,16 @@ impl HttpOutbound {
         let enc = FrameEncoder::new(cipher.clone(), CounterGen::stream());
 
         // prelude: AUTH frame sealed with the static key, first bytes either
-        // way
+        // way. Random tail pads the ciphertext length away from a fixed
+        // protocol signature (server decodes by field prefix).
         let static_cipher = Arc::new(FrameCipher::new(&self.static_key));
+        let mut auth_payload = auth.encode();
+        auth_payload.extend_from_slice(&random_padding());
         let auth_wire = FrameEncoder::new(static_cipher, CounterGen::stream()).encode(
             FrameType::Auth,
             0,
             0,
-            &auth.encode(),
+            &auth_payload,
         )?;
 
         if self.ws {
@@ -213,13 +244,20 @@ impl HttpOutbound {
             http::HeaderValue::from_static(USER_AGENT),
         );
 
-        let (ws, _resp) = tokio_tungstenite::connect_async_tls_with_config(
-            req,
-            None,
-            false,
-            Some(Connector::Rustls(tls.clone())),
+        // Bounded like every other connect step: on a blackholed path an
+        // unbounded await would hang while holding the mux lock, stalling
+        // every subsequent open_tcp/udp_associate behind it.
+        let (ws, _resp) = timeout(
+            Duration::from_secs(30),
+            tokio_tungstenite::connect_async_tls_with_config(
+                req,
+                None,
+                false,
+                Some(Connector::Rustls(tls.clone())),
+            ),
         )
         .await
+        .map_err(|_| anyhow!("ws connect timeout"))?
         .map_err(|e| anyhow!("ws connect failed: {e}"))?;
         debug!("fallback: ws channel up {}", self.url);
 
@@ -298,13 +336,17 @@ impl HttpOutbound {
     }
 }
 
-fn build_client(skip_verify: bool) -> Result<HyperClient> {
+fn build_client(
+    skip_verify: bool,
+    pin: Option<[u8; 32]>,
+    resolver: Option<super::tls::HyperFixedResolver>,
+) -> Result<HyperClient> {
     // Large/adaptive h2 flow-control windows: the spec default (64KB stream
     // window) collapses throughput on high-RTT links (~200KB/s @ 300ms).
     // The client-advertised window governs the download direction.
     // NOTE: hyper-util builder setters take &mut and return &mut, so the
     // chain must stay a single expression per branch.
-    if !skip_verify {
+    if !skip_verify && pin.is_none() && resolver.is_none() {
         let https = HttpsConnectorBuilder::new()
             .with_native_roots()?
             .https_or_http()
@@ -317,14 +359,52 @@ fn build_client(skip_verify: bool) -> Result<HyperClient> {
             .build(https));
     }
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let tls_builder = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
-        .map_err(|e| anyhow!("tls versions: {e}"))?;
-    let mut tls = tls_builder
-        .with_root_certificates(rustls::RootCertStore::empty())
-        .with_no_client_auth();
-    tls.dangerous()
-        .set_certificate_verifier(Arc::new(NoVerify { provider }));
+    let tls_builder = rustls::ClientConfig::builder_with_provider(provider.clone());
+    let tls_builder = if pin.is_some() {
+        tls_builder
+            .with_ech(rustls::client::EchMode::Grease(
+                rustls::client::EchGreaseConfig::new(
+                    &super::ech::HpkeX25519Sha256ChaCha20,
+                    rustls::crypto::hpke::HpkePublicKey(vec![0u8; 32]),
+                ),
+            ))
+            .map_err(|e| anyhow!("ech grease enable: {e}"))?
+    } else {
+        tls_builder
+            .with_safe_default_protocol_versions()
+            .map_err(|e| anyhow!("tls versions: {e}"))?
+    };
+    let mut tls = if pin.is_some() {
+        tls_builder
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth()
+    } else {
+        let mut roots = rustls::RootCertStore::empty();
+        if !skip_verify {
+            for cert in rustls_native_certs::load_native_certs().certs {
+                let _ = roots.add(cert);
+            }
+        }
+        tls_builder
+            .with_root_certificates(roots)
+            .with_no_client_auth()
+    };
+    if let Some(fp) = pin {
+        tls.dangerous()
+            .set_certificate_verifier(Arc::new(super::tls::PinVerifier::new(fp, provider)));
+    } else if skip_verify {
+        tls.dangerous()
+            .set_certificate_verifier(Arc::new(NoVerify { provider }));
+    }
+    // One connector type for both branches: the fixed resolver is a no-op
+    // stand-in when masquerade is off (never consulted — GaiResolver would
+    // be the natural choice, but mixing connector types would split the
+    // Client generic).
+    let mut http: HttpConnector<HyperFixedResolver> = match resolver {
+        Some(r) => HttpConnector::new_with_resolver(r),
+        None => HttpConnector::new_with_resolver(HyperFixedResolver::system_fallback()),
+    };
+    http.set_nodelay(true);
     let https = HttpsConnectorBuilder::new()
         .with_tls_config(tls)
         .https_or_http()
@@ -339,19 +419,24 @@ fn build_client(skip_verify: bool) -> Result<HyperClient> {
 
 /// TLS config for the WebSocket transport. Deliberately **no ALPN**: the WS
 /// handshake must ride HTTP/1.1 (an h2 connection cannot be upgraded).
-fn build_ws_tls(skip_verify: bool) -> Result<rustls::ClientConfig> {
+/// `--pin` is accepted here for uniformity but the config layer rejects the
+/// wss + masquerade combination; pinning alone (no `--sni`) is valid.
+fn build_ws_tls(skip_verify: bool, pin: Option<[u8; 32]>) -> Result<rustls::ClientConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
         .map_err(|e| anyhow!("tls versions: {e}"))?;
     let mut roots = rustls::RootCertStore::empty();
-    if !skip_verify {
+    if !skip_verify && pin.is_none() {
         for cert in rustls_native_certs::load_native_certs().certs {
             let _ = roots.add(cert);
         }
     }
     let mut tls = builder.with_root_certificates(roots).with_no_client_auth();
-    if skip_verify {
+    if let Some(fp) = pin {
+        tls.dangerous()
+            .set_certificate_verifier(Arc::new(super::tls::PinVerifier::new(fp, provider)));
+    } else if skip_verify {
         tls.dangerous()
             .set_certificate_verifier(Arc::new(NoVerify { provider }));
     }

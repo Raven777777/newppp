@@ -234,10 +234,14 @@ impl FrameDecoder {
         let payload = if self.raw {
             ct.to_vec()
         } else if let Some(cipher) = self.cipher.as_ref() {
+            // Authenticate before advancing the replay window. Otherwise an
+            // unauthenticated datagram with a large counter could permanently
+            // move the window forward and suppress valid packets.
+            let payload = cipher.open(info.counter, &info.aad, &ct)?;
             if let Some(w) = &mut self.window {
                 ensure!(w.check(info.counter), "replayed datagram counter");
             }
-            cipher.open(info.counter, &info.aad, &ct)?
+            payload
         } else {
             ct.to_vec()
         };
@@ -342,6 +346,22 @@ pub fn encode_open(host: &str, port: u16) -> Vec<u8> {
     v
 }
 
+/// Random tail appended to handshake-frame payloads (Open / Auth) so their
+/// ciphertext length does not form a fixed, protocol-revealing signature on
+/// the wire. Decoders ignore the tail: `decode_open` / `AuthPayload::decode`
+/// read fields by prefix and never check for exact payload length.
+/// Range `[PAD_MIN, PAD_MAX)` bytes, uniform.
+pub const PAD_MIN: usize = 64;
+pub const PAD_MAX: usize = 512;
+
+pub fn random_padding() -> Vec<u8> {
+    use rand::RngCore;
+    let len = PAD_MIN + (rand::rngs::OsRng.next_u32() as usize % (PAD_MAX - PAD_MIN));
+    let mut pad = vec![0u8; len];
+    rand::rngs::OsRng.fill_bytes(&mut pad);
+    pad
+}
+
 pub fn decode_open(payload: &[u8]) -> Result<(String, u16)> {
     ensure!(payload.len() >= 4, "open payload truncated");
     let hl = u16::from_le_bytes([payload[0], payload[1]]) as usize;
@@ -401,6 +421,24 @@ mod tests {
     }
 
     #[test]
+    fn invalid_high_counter_does_not_poison_replay_window() {
+        let cipher = Arc::new(FrameCipher::new(&[8u8; 32]));
+        let enc = FrameEncoder::new(cipher.clone(), CounterGen::stream());
+        let valid = enc.encode(FrameType::Data, 0, 1, b"valid").unwrap();
+        let mut forged = enc
+            .encode(FrameType::Data, 0, 2, b"forged")
+            .unwrap()
+            .to_vec();
+        forged[12..20].copy_from_slice(&1000u64.to_le_bytes());
+
+        let mut dec = FrameDecoder::new(Some(cipher), Some(ReplayWindow::new()));
+        dec.feed(&forged);
+        assert!(dec.next_frame().is_err());
+        dec.feed(&valid);
+        assert_eq!(dec.next_frame().unwrap().unwrap().payload, b"valid");
+    }
+
+    #[test]
     fn fragmented_feed() {
         let cipher = Arc::new(FrameCipher::new(&[3u8; 32]));
         let enc = FrameEncoder::new(cipher.clone(), CounterGen::stream());
@@ -439,6 +477,30 @@ mod tests {
         let (h, po) = decode_open(&p).unwrap();
         assert_eq!(h, "example.com");
         assert_eq!(po, 443);
+    }
+
+    /// Handshake payloads carry a random tail; decoders read fields by
+    /// prefix and must ignore it (this is what makes the padding protocol-
+    /// compatible without a version bump).
+    #[test]
+    fn open_decode_ignores_padding_tail() {
+        let mut p = encode_open("example.com", 443);
+        p.extend_from_slice(&random_padding());
+        let (h, po) = decode_open(&p).unwrap();
+        assert_eq!(h, "example.com");
+        assert_eq!(po, 443);
+    }
+
+    #[test]
+    fn random_padding_length_in_band() {
+        for _ in 0..1000 {
+            let pad = random_padding();
+            assert!(
+                (PAD_MIN..PAD_MAX).contains(&pad.len()),
+                "padding length {} out of band",
+                pad.len()
+            );
+        }
     }
 }
 

@@ -6,7 +6,7 @@
 //! * type 3: domain (u8 len + bytes)
 
 use anyhow::{ensure, Result};
-use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{SocketAddrV4, SocketAddrV6};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum UdpAddr {
@@ -87,23 +87,6 @@ impl UdpAddr {
             _ => anyhow::bail!("bad address type {t}"),
         }
     }
-
-    /// Resolve to a socket address (DNS for domains), 5s timeout.
-    pub async fn resolve(&self) -> Result<SocketAddr> {
-        match self {
-            UdpAddr::V4(a) => Ok(SocketAddr::V4(*a)),
-            UdpAddr::V6(a) => Ok(SocketAddr::V6(*a)),
-            UdpAddr::Domain(h, p) => {
-                let fut = tokio::net::lookup_host((h.as_str(), *p));
-                let mut addrs = tokio::time::timeout(std::time::Duration::from_secs(5), fut)
-                    .await
-                    .map_err(|_| anyhow::anyhow!("resolve timeout"))??;
-                addrs
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("no addresses for {h}"))
-            }
-        }
-    }
 }
 
 pub struct Reader<'a> {
@@ -152,7 +135,8 @@ impl<'a> Reader<'a> {
 /// Ports are network byte order (RFC 1928). Fragmented datagrams rejected.
 pub fn parse_socks5_udp(packet: &[u8]) -> Result<(UdpAddr, Vec<u8>)> {
     let mut r = Reader::new(packet);
-    let _rsv = r.read_u16()?;
+    let rsv = r.read_u16()?;
+    ensure!(rsv == 0, "SOCKS5 UDP reserved field must be zero");
     let frag = r.read_u8()?;
     ensure!(frag == 0, "UDP fragmentation not supported");
     let addr = UdpAddr::decode_with(&mut r, true)?;
@@ -205,5 +189,15 @@ mod tests {
         let (t2, p2) = parse_socks5_udp(&pkt).unwrap();
         assert_eq!(target, t2);
         assert_eq!(p2, b"payload");
+    }
+
+    #[test]
+    fn socks5_udp_rejects_nonzero_reserved_field() {
+        let mut packet = build_socks5_udp(
+            &UdpAddr::V4(SocketAddrV4::new([1, 2, 3, 4].into(), 9999)),
+            b"payload",
+        );
+        packet[0] = 1;
+        assert!(parse_socks5_udp(&packet).is_err());
     }
 }

@@ -6,6 +6,7 @@
 pub mod client;
 pub mod clock;
 pub mod config;
+pub mod health;
 pub mod proto;
 pub mod quic_tune;
 pub mod server;

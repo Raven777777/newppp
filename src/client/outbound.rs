@@ -1,8 +1,9 @@
 //! Outbound transport selection with automatic degradation:
 //! WebTransport (h3/QUIC) primary -> HTTPS POST (mode A) fallback.
 
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 
@@ -63,6 +64,19 @@ const BREAKER_THRESHOLD: u32 = 3;
 /// ...and how long the primary path stays skipped afterwards.
 const BREAKER_COOLDOWN: Duration = Duration::from_secs(60);
 
+/// Unix millis of the last time the HTTPS POST fallback carried traffic
+/// (0 = never). Read by `/healthz` (`last_fallback_at`); written whenever
+/// the degraded path is taken.
+pub static LAST_FALLBACK_MILLIS: AtomicI64 = AtomicI64::new(0);
+
+pub fn note_fallback() {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    LAST_FALLBACK_MILLIS.store(millis, Ordering::Relaxed);
+}
+
 /// Circuit breaker for the WT primary path (`Both` mode).
 ///
 /// Counts consecutive *transport-level* failures (target-side refusals count
@@ -100,6 +114,11 @@ impl CircuitBreaker {
     pub fn can_try(&self) -> bool {
         let g = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         !g.tripped_until.is_some_and(|t| Instant::now() < t)
+    }
+
+    /// Whether the breaker is currently tripped (skipping the primary).
+    pub fn is_open(&self) -> bool {
+        !self.can_try()
     }
 
     pub fn record_success(&self) {
@@ -144,9 +163,9 @@ impl Outbound {
     pub async fn build(cfg: &ClientConfig) -> Result<Outbound> {
         match (&cfg.wt_url, &cfg.fb_url) {
             (Some(u), Some(f)) => {
-                let pool = Arc::new(WtPool::new(cfg, u)?);
+                let pool = Arc::new(super::wt::new_pool(cfg, u).await?);
                 pool.spawn_maintenance();
-                let http = Arc::new(HttpOutbound::new(cfg, f)?);
+                let http = Arc::new(HttpOutbound::new(cfg, f).await?);
                 Ok(Outbound::Both(
                     pool,
                     http,
@@ -154,11 +173,11 @@ impl Outbound {
                 ))
             }
             (Some(u), None) => {
-                let pool = Arc::new(WtPool::new(cfg, u)?);
+                let pool = Arc::new(super::wt::new_pool(cfg, u).await?);
                 pool.spawn_maintenance();
                 Ok(Outbound::Wt(pool))
             }
-            (None, Some(f)) => Ok(Outbound::Http(Arc::new(HttpOutbound::new(cfg, f)?))),
+            (None, Some(f)) => Ok(Outbound::Http(Arc::new(HttpOutbound::new(cfg, f).await?))),
             (None, None) => anyhow::bail!("no outbound configured"),
         }
     }
@@ -202,6 +221,7 @@ impl Outbound {
                 } else {
                     tracing::debug!("WT circuit open: {host}:{port} goes to fallback directly");
                 }
+                note_fallback();
                 h.open_tcp(host, port).await
             }
         }
@@ -235,6 +255,7 @@ impl Outbound {
                 } else {
                     tracing::debug!("WT circuit open: UDP goes to fallback directly");
                 }
+                note_fallback();
                 h.udp_associate().await
             }
         }

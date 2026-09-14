@@ -25,7 +25,7 @@ use newppp::client::fallback::HttpOutbound;
 use newppp::client::http_proxy;
 use newppp::client::outbound::{error_tag, target_error, CircuitBreaker, Outbound};
 use newppp::client::socks5;
-use newppp::client::wt::WtPool;
+
 use newppp::config::{CertSource, ClientConfig, ServerConfig};
 use newppp::proto::crypto::{
     auth_mac, derive_static_key, make_bearer, now_unix, AuthPayload, CounterGen, FrameCipher,
@@ -66,7 +66,10 @@ fn client_cfg(wt: Option<String>, fb: Option<String>) -> ClientConfig {
         uid: UID.into(),
         password: PASS.into(),
         skip_verify: true,
+        sni: None,
+        pin: None,
         recv_window: 2 * 1024 * 1024,
+        health: None,
     }
 }
 
@@ -79,6 +82,8 @@ struct TestServer {
     wt_port: u16,
     fb_port: u16,
     tasks: Vec<JoinHandle<()>>,
+    /// Path of the server's cert PEM (for F-6 pin fingerprinting).
+    cert_path: Option<std::path::PathBuf>,
 }
 
 impl TestServer {
@@ -144,6 +149,8 @@ fn server_cfg(allow_private: bool, wrong_pass: bool) -> ServerConfig {
         allow_private_targets: allow_private,
         max_unauth: 128,
         recv_window: 2 * 1024 * 1024,
+        shutdown_grace: 10,
+        health: None,
     }
 }
 
@@ -168,15 +175,24 @@ async fn dev_tls() -> Result<(std::path::PathBuf, std::path::PathBuf)> {
 
 /// Full server: WT + TLS fallback listeners, with an inspectable state.
 async fn spawn_server(allow_private: bool) -> Result<TestServer> {
+    spawn_server_sessions(allow_private, 200).await
+}
+
+/// Same as [`spawn_server`] but with an explicit global session cap, so tests
+/// can force a server-side resource-limit rejection deterministically.
+async fn spawn_server_sessions(allow_private: bool, max_sessions: usize) -> Result<TestServer> {
     let (cert, key) = dev_tls().await?;
     let identity = wtransport::Identity::load_pemfiles(&cert, &key).await?;
-    let state = newppp::server::build_state(&server_cfg(allow_private, false));
+    let mut cfg = server_cfg(allow_private, false);
+    cfg.max_sessions = max_sessions;
+    let state = newppp::server::build_state(&cfg);
 
     let wt_port = free_port();
     let fb_port = free_port();
 
     let st_wt = state.clone();
     let st_fb = state.clone();
+    let cert_for_fb = cert.clone();
     let tasks = vec![
         tokio::spawn(async move {
             let _ = srv_wt::run_wt(
@@ -191,7 +207,7 @@ async fn spawn_server(allow_private: bool) -> Result<TestServer> {
             let _ = srv_fallback::run_tls(
                 st_fb,
                 SocketAddr::from(([127, 0, 0, 1], fb_port)),
-                cert,
+                cert_for_fb,
                 key,
             )
             .await;
@@ -205,9 +221,9 @@ async fn spawn_server(allow_private: bool) -> Result<TestServer> {
         wt_port,
         fb_port,
         tasks,
+        cert_path: Some(cert),
     })
 }
-
 /// WT listener that always refuses credentials — a deterministic fast
 /// "unreachable primary" for the degradation-chain test (same classified
 /// outcome as a dead port: a transport-level failure, fast on loopback).
@@ -278,16 +294,20 @@ async fn start_client(cfg: ClientConfig, with_http: bool) -> Result<ClientStack>
     })
 }
 
-fn wt_outbound(url: &str) -> Outbound {
+async fn wt_outbound(url: &str) -> Outbound {
     let cfg = client_cfg(Some(url.to_string()), None);
-    let pool = Arc::new(WtPool::new(&cfg, url).expect("wt pool"));
+    let pool = Arc::new(
+        newppp::client::wt::new_pool(&cfg, url)
+            .await
+            .expect("wt pool"),
+    );
     Outbound::Wt(pool)
 }
 
-fn post_outbound(url: &str) -> Outbound {
+async fn post_outbound(url: &str) -> Outbound {
     let cfg = client_cfg(None, Some(url.to_string()));
     Outbound::Http(Arc::new(
-        HttpOutbound::new(&cfg, url).expect("http outbound"),
+        HttpOutbound::new(&cfg, url).await.expect("http outbound"),
     ))
 }
 
@@ -706,6 +726,52 @@ async fn udp_over_mtu_falls_back_to_stream() {
     srv.shutdown().await;
 }
 
+/// 5b: a mode-A (HTTPS POST) UDP ASSOCIATE rejected by the server session cap
+/// must fail fast with a SOCKS5 error reply, not hang until the 10s in-band
+/// handshake timeout. Regression: the mode-A client only checked the TCP
+/// pending map for the server's `OpenErr`, so a failed UDP associate was
+/// never woken and every caller waited out `HANDSHAKE_TIMEOUT`.
+#[tokio::test]
+async fn fallback_udp_associate_limit_fails_fast() {
+    // max_sessions = 1: the held CONNECT below owns the only slot, so the
+    // subsequent UDP ASSOCIATE is refused with `session-limit`.
+    let srv = spawn_server_sessions(true, 1).await.expect("server");
+    let target = spawn_target().await.expect("target");
+    let cli = start_client(client_cfg(None, Some(srv.fb_url())), false)
+        .await
+        .expect("client");
+
+    // Keep the single session open: a completed request would release it.
+    let _held = socks5_connect(cli.socks_port, "127.0.0.1", target)
+        .await
+        .expect("connect over POST fallback");
+
+    let code = timeout(Duration::from_secs(5), async {
+        let mut s = TcpStream::connect(("127.0.0.1", cli.socks_port))
+            .await
+            .expect("udp control connect");
+        s.write_all(b"\x05\x01\x00").await.expect("greeting");
+        let mut method = [0u8; 2];
+        s.read_exact(&mut method).await.expect("method reply");
+        assert_eq!(method, [5, 0]);
+        s.write_all(b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00")
+            .await
+            .expect("udp associate request");
+        let mut head = [0u8; 4];
+        s.read_exact(&mut head).await.expect("udp associate reply");
+        head[1]
+    })
+    .await
+    .expect("capped UDP ASSOCIATE must be refused promptly, not stall to the 10s timeout");
+    assert_ne!(
+        code, 0,
+        "a capped UDP ASSOCIATE must carry a non-zero SOCKS5 reply code"
+    );
+
+    cli.shutdown().await;
+    srv.shutdown().await;
+}
+
 /// 7: private targets denied by default (SOCKS 0x02; HTTP CONNECT 502 with
 /// `X-Newppp-Error: private-target-denied`), allowed under the opt-in flag;
 /// a refused dial is classified as 0x05.
@@ -895,10 +961,11 @@ async fn tcp_half_close_target_finishes() {
     let payload = b"late-response-after-client-fin".as_slice();
     let hc_port = spawn_halfclose_target(payload).await.expect("target");
 
-    for (label, ob) in [
-        ("WT", wt_outbound(&srv.wt_url())),
-        ("POST", post_outbound(&srv.fb_url())),
-    ] {
+    let cases = [
+        ("WT", wt_outbound(&srv.wt_url()).await),
+        ("POST", post_outbound(&srv.fb_url()).await),
+    ];
+    for (label, ob) in cases {
         let port = free_port();
         let _inbound = tokio::spawn(socks5::run(format!("127.0.0.1:{port}"), ob, None));
         wait_tcp_port(port).await.expect("socks inbound");
@@ -935,9 +1002,16 @@ async fn degradation_chain_dead_primary_fallback_and_breaker() {
         Some(format!("https://127.0.0.1:{dead_wt}")),
         Some(srv.fb_url()),
     );
-    let pool = Arc::new(WtPool::new(&cfg, cfg.wt_url.as_ref().unwrap()).expect("wt pool"));
-    let http =
-        Arc::new(HttpOutbound::new(&cfg, cfg.fb_url.as_ref().unwrap()).expect("http fallback"));
+    let pool = Arc::new(
+        newppp::client::wt::new_pool(&cfg, cfg.wt_url.as_ref().unwrap())
+            .await
+            .expect("wt pool"),
+    );
+    let http = Arc::new(
+        HttpOutbound::new(&cfg, cfg.fb_url.as_ref().unwrap())
+            .await
+            .expect("http fallback"),
+    );
     let cb = Arc::new(CircuitBreaker::new(3, Duration::from_millis(400)));
     let ob = Outbound::Both(pool, http, cb.clone());
     assert!(cb.can_try(), "fresh breaker must be closed");
@@ -988,9 +1062,15 @@ async fn target_failure_does_not_degrade_or_kill() {
         Some(srv.wt_url()),
         Some(format!("https://127.0.0.1:{unbound}/api/ppp")),
     );
-    let pool = Arc::new(WtPool::new(&cfg, cfg.wt_url.as_ref().unwrap()).expect("wt pool"));
+    let pool = Arc::new(
+        newppp::client::wt::new_pool(&cfg, cfg.wt_url.as_ref().unwrap())
+            .await
+            .expect("wt pool"),
+    );
     let http = Arc::new(
-        HttpOutbound::new(&cfg, cfg.fb_url.as_ref().unwrap()).expect("dead http fallback"),
+        HttpOutbound::new(&cfg, cfg.fb_url.as_ref().unwrap())
+            .await
+            .expect("dead http fallback"),
     );
     let cb = Arc::new(CircuitBreaker::new(3, Duration::from_secs(60)));
     let ob = Outbound::Both(pool, http, cb.clone());
@@ -1059,7 +1139,7 @@ async fn lifecycle_no_leak_ports_reusable() {
     let fb_port = srv.fb_port;
     let target = spawn_target().await.expect("target");
 
-    let ob = wt_outbound(&srv.wt_url());
+    let ob = wt_outbound(&srv.wt_url()).await;
     let socks_port = free_port();
     let ob_inbound = ob.clone();
     let inbound = tokio::spawn(async move {
@@ -1080,6 +1160,57 @@ async fn lifecycle_no_leak_ports_reusable() {
 
     // Server teardown: both listener ports reusable promptly after drop.
     srv.shutdown().await;
+    wait_rebindable_tcp(fb_port, "fallback TLS").await;
+    wait_rebindable_udp(wt_port, "WT").await;
+}
+
+/// P3-1: the production shutdown path (`run_with_shutdown`) must release the
+/// QUIC (UDP) and fallback (TCP) ports immediately: live connections are
+/// cancelled first, then listeners dropped — the `TestServer::shutdown`
+/// sequence, not a bare `tasks.abort_all()`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graceful_shutdown_releases_ports() {
+    let (cert, key) = dev_tls().await.expect("tls");
+    let wt_port = free_port();
+    let fb_port = free_port();
+
+    let mut cfg = server_cfg(true, false);
+    cfg.cert = CertSource::Files {
+        cert: cert.to_string_lossy().into_owned(),
+        key: key.to_string_lossy().into_owned(),
+    };
+    cfg.listen = Some(format!("127.0.0.1:{wt_port}"));
+    cfg.fallback_listen = Some(format!("127.0.0.1:{fb_port}"));
+    // TCP-only ports come up fast; run the WT handshake before shutdown so a
+    // live connection exists and must be cancelled by the drain step.
+    let token = tokio_util::sync::CancellationToken::new();
+    let run_token = token.clone();
+    let task =
+        tokio::spawn(
+            async move { newppp::server::run_with_shutdown(cfg, run_token.clone()).await },
+        );
+    wait_tcp_port(fb_port).await.expect("fallback up");
+    tokio::time::sleep(Duration::from_millis(300)).await; // WT UDP binds
+
+    let bearer = make_bearer(&derive_static_key(PASS, UID), UID);
+    let conn = raw_wt_connect(
+        &format!("https://127.0.0.1:{wt_port}"),
+        Some(format!("Bearer {bearer}")),
+    )
+    .await
+    .expect("wt session");
+    complete_wt_auth(conn).await.expect("auth");
+
+    token.cancel();
+    timeout(Duration::from_secs(10), async {
+        match task.await {
+            Ok(Ok(())) => {} // exit code 0 path
+            other => panic!("run_with_shutdown ended badly: {other:?}"),
+        }
+    })
+    .await
+    .expect("server did not shut down within 10s");
+
     wait_rebindable_tcp(fb_port, "fallback TLS").await;
     wait_rebindable_udp(wt_port, "WT").await;
 }
@@ -1217,4 +1348,90 @@ async fn raw_wt_connect(url: &str, auth: Option<String>) -> Result<wtransport::C
     timeout(HANDSHAKE, ep.connect(opts.build()))
         .await?
         .map_err(|e| anyhow!("wt connect failed: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// F-6: --sni masquerade + --pin certificate pinning
+// ---------------------------------------------------------------------------
+
+/// SHA-256 fingerprint of a PEM certificate file (hex, lowercase).
+fn pem_fingerprint(cert_path: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+    let pem = std::fs::read(cert_path).expect("read cert pem");
+    // Minimal PEM decode: strip header/footer/base64 lines -> DER.
+    let b64: String = String::from_utf8_lossy(&pem)
+        .lines()
+        .filter(|l| !l.starts_with("-----") && !l.trim().is_empty())
+        .collect();
+    use base64::Engine as _;
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .expect("pem base64");
+    hex_encode(&Sha256::digest(&der))
+}
+
+fn hex_encode(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// F-6 happy path: client connects with a masqueraded SNI name (the URL
+/// carries the real address; `--sni` rewrites the host), pinning the
+/// server's self-signed certificate. The connection must succeed and serve
+/// a SOCKS5 CONNECT round trip.
+#[tokio::test]
+async fn sni_masquerade_with_pin_connects() {
+    let srv = spawn_server(true).await.expect("server");
+    let target = spawn_target().await.expect("target");
+
+    let cert_path = srv
+        .cert_path
+        .clone()
+        .expect("server harness retains cert path");
+    let fp = pem_fingerprint(&cert_path);
+
+    let mut cfg = client_cfg(Some(srv.wt_url()), None);
+    cfg.skip_verify = false;
+    cfg.sni = Some("masquerade.invalid".into());
+    cfg.pin = Some(decode_hex(&fp));
+    let cli = start_client(cfg, false).await.expect("client");
+
+    socks5_get(cli.socks_port, "127.0.0.1", target)
+        .await
+        .expect("socks5 CONNECT over masqueraded SNI + pin");
+
+    cli.shutdown().await;
+    srv.shutdown().await;
+}
+
+/// F-6 negative: a wrong fingerprint must be refused during the handshake.
+#[tokio::test]
+async fn sni_masquerade_wrong_pin_rejected() {
+    let srv = spawn_server(true).await.expect("server");
+
+    let mut wrong = [0u8; 32];
+    wrong[0] = 0xAA;
+    let mut cfg = client_cfg(Some(srv.wt_url()), None);
+    cfg.skip_verify = false;
+    cfg.sni = Some("masquerade.invalid".into());
+    cfg.pin = Some(wrong);
+    let started = start_client(cfg, false).await;
+    let cli = started.expect("inbounds bind locally regardless of TLS");
+
+    // Any CONNECT attempt must fail (transport-level), never succeed.
+    let res = socks5_get(cli.socks_port, "127.0.0.1", 9).await;
+    assert!(res.is_err(), "wrong pin must not complete a session");
+
+    cli.shutdown().await;
+    srv.shutdown().await;
+}
+
+fn decode_hex(s: &str) -> [u8; 32] {
+    let b = s.as_bytes();
+    let mut out = [0u8; 32];
+    for (i, chunk) in b.chunks(2).enumerate() {
+        let hi = (chunk[0] as char).to_digit(16).expect("hex hi");
+        let lo = (chunk[1] as char).to_digit(16).expect("hex lo");
+        out[i] = ((hi << 4) | lo) as u8;
+    }
+    out
 }

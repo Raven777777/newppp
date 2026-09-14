@@ -62,12 +62,18 @@ impl UnauthGate {
     }
 
     fn release_ip(&self, ip: IpAddr) {
-        if let Some(mut e) = self.per_ip.get_mut(&ip) {
-            *e = e.saturating_sub(1);
-            if *e == 0 {
-                drop(e);
-                self.per_ip.remove(&ip);
+        // `entry()` holds the shard lock across decrement + removal, so a
+        // concurrent `try_admit` for the same IP cannot sneak an increment
+        // between the two (dropping the guard first would let `remove`
+        // delete a count a fresh admission had just taken).
+        match self.per_ip.entry(ip) {
+            dashmap::mapref::entry::Entry::Occupied(mut e) => {
+                *e.get_mut() = e.get().saturating_sub(1);
+                if *e.get() == 0 {
+                    e.remove();
+                }
             }
+            dashmap::mapref::entry::Entry::Vacant(_) => {}
         }
     }
 

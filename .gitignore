@@ -3,3 +3,5 @@
 *.log
 .cacert.pem
 *.tar
+# Local config file holds --auth passwords; never commit it.
+newppp.conf

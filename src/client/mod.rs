@@ -1,10 +1,14 @@
 //! Client entry: builds the outbound and starts the local inbounds.
 
+pub mod ech;
 pub mod fallback;
 pub mod http_proxy;
 pub mod outbound;
 pub mod socks5;
+pub mod tls;
 pub mod wt;
+
+use std::sync::Arc;
 
 use anyhow::Result;
 use tracing::info;
@@ -25,8 +29,26 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 pub async fn run(cfg: ClientConfig) -> Result<()> {
+    let started = std::time::Instant::now();
     let ob = Outbound::build(&cfg).await?;
     info!("newppp client up (outbound: {})", ob.describe());
+
+    let mut health_task = None;
+    if let Some(h) = &cfg.health {
+        health_task = Some(
+            crate::health::spawn(
+                h,
+                Arc::new(crate::health::Health::new(
+                    started,
+                    crate::health::Source::Client {
+                        outbound: ob.clone(),
+                    },
+                )),
+                "client",
+            )
+            .await?,
+        );
+    }
 
     let mut socks = tokio::spawn({
         let ob = ob.clone();
@@ -63,6 +85,10 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
     socks.abort();
     if let Some(task) = http_task {
         task.abort();
+    }
+    if let Some(task) = health_task {
+        task.abort();
+        let _ = task.await;
     }
     Ok(())
 }

@@ -24,8 +24,8 @@ use crate::proto::crypto::{
     SALT_LEN,
 };
 use crate::proto::frame::{
-    encode_open, FrameDecoder, FrameEncoder, FrameReader, FrameType, FrameWriter, FLAG_FIN,
-    MAX_PLAINTEXT,
+    encode_open, random_padding, FrameDecoder, FrameEncoder, FrameReader, FrameType, FrameWriter,
+    FLAG_FIN, MAX_PLAINTEXT,
 };
 use crate::proto::mux::{
     next_rand_u32, BoxStream, OpenError, OutFrame, UdpPipe, HANDSHAKE_TIMEOUT, SESSION_BUF,
@@ -42,9 +42,50 @@ pub(crate) struct PoolCfg {
     size: usize,
 }
 
+/// Build the WT pool from the client config. `--sni` masquerade rewires the
+/// URL: the masquerade hostname replaces the URL host (driving TLS SNI and
+/// the WebTransport `:authority`), while a fixed-address resolver points the
+/// connection at the real server address taken from the original URL.
+pub async fn new_pool(cfg: &ClientConfig, url: &str) -> Result<WtPool> {
+    let (dial_url, resolver): (String, Option<super::tls::FixedResolver>) = match &cfg.sni {
+        Some(sni) => {
+            let (real_addr, _port) = url_host_and_port(url).await?;
+            let mut u = url::Url::parse(url).map_err(|e| anyhow!("bad --server URL: {e}"))?;
+            u.set_host(Some(sni))
+                .map_err(|_| anyhow!("--sni '{sni}' cannot replace the URL host"))?;
+            u.set_port(None).ok(); // keep default 443 semantics of the original
+            (
+                u.to_string(),
+                Some(super::tls::FixedResolver::new(real_addr)),
+            )
+        }
+        None => (url.to_string(), None),
+    };
+    // Build the endpoint from the (possibly masqueraded) URL; the resolver
+    // must be attached at config time — wtransport's Endpoint exposes no
+    // post-construction config mutation for clients.
+    let mut wt_cfg = build_tls_config_inner(cfg.skip_verify, cfg.pin, cfg.recv_window)?;
+    if let Some(r) = resolver {
+        wt_cfg.set_dns_resolver(r);
+    }
+    let endpoint = Endpoint::client(wt_cfg)?;
+
+    let static_key = crate::proto::crypto::derive_static_key(&cfg.password, &cfg.uid);
+    Ok(WtPool {
+        cfg: Arc::new(PoolCfg {
+            url: dial_url,
+            static_key,
+            uid: cfg.uid.clone(),
+            size: cfg.conns,
+        }),
+        endpoint,
+        conns: Mutex::new(Vec::new()),
+    })
+}
+
 pub struct WtPool {
     cfg: Arc<PoolCfg>,
-    endpoint: Endpoint<WtClientSide>,
+    pub(crate) endpoint: Endpoint<WtClientSide>,
     conns: Mutex<Vec<Arc<WtConn>>>,
 }
 
@@ -70,22 +111,18 @@ pub struct WtConn {
 
 const PONG_MISS_LIMIT: usize = 2;
 
-impl WtPool {
-    pub fn new(cfg: &ClientConfig, url: &str) -> Result<WtPool> {
-        let static_key = crate::proto::crypto::derive_static_key(&cfg.password, &cfg.uid);
-        let endpoint = Endpoint::client(build_tls_config(cfg.skip_verify, cfg.recv_window)?)?;
-        Ok(WtPool {
-            cfg: Arc::new(PoolCfg {
-                url: url.to_string(),
-                static_key,
-                uid: cfg.uid.clone(),
-                size: cfg.conns,
-            }),
-            endpoint,
-            conns: Mutex::new(Vec::new()),
-        })
-    }
+/// Base heartbeat period.
+const HEARTBEAT_SECS: u64 = 30;
 
+/// Next heartbeat period: 30s ± 20% (24s..36s), uniform. Public for tests.
+fn heartbeat_interval() -> Duration {
+    use rand::Rng;
+    let band = (HEARTBEAT_SECS / 5) as i64; // 20% of base = 6s
+    let jitter: i64 = rand::rngs::OsRng.gen_range(-band..=band);
+    Duration::from_secs((HEARTBEAT_SECS as i64 + jitter) as u64)
+}
+
+impl WtPool {
     /// Background maintenance: drop dead conns, keep the pool warm, trim
     /// surplus idle conns.
     ///
@@ -212,30 +249,86 @@ impl WtPool {
     }
 }
 
-fn build_tls_config(skip_verify: bool, recv_window: u32) -> Result<WtClientConfig> {
-    use wtransport::tls::client::build_default_tls_config;
+/// Build the WebTransport client TLS config with an optional `--pin`
+/// fingerprint: when set, the pinned-certificate verifier replaces CA
+/// validation entirely (the server's identity is exactly that certificate —
+/// required for `--sni` masquerade, where the cert cannot match the
+/// masqueraded name).
+fn build_tls_config_inner(
+    skip_verify: bool,
+    pin: Option<[u8; 32]>,
+    recv_window: u32,
+) -> Result<WtClientConfig> {
     use wtransport::tls::client::NoServerVerification;
 
-    // Custom transport requires building the TLS layer ourselves; this
-    // mirrors what the stock builder does (native roots / no-verification).
+    // Custom TLS + transport: mirrors wtransport's stock builder (native
+    // roots / no-verification) but built by hand so GREASE ECH can be
+    // inserted at the builder stage (rustls 0.23 has no post-hoc config
+    // rewrite; `with_ech` must be called before root stores are attached).
     let mut root_store = rustls::RootCertStore::empty();
-    if !skip_verify {
+    if !skip_verify && pin.is_none() {
         for cert in rustls_native_certs::load_native_certs().certs {
             let _ = root_store.add(cert);
         }
     }
-    let verifier: Option<Arc<dyn rustls::client::danger::ServerCertVerifier>> = if skip_verify {
-        Some(Arc::new(NoServerVerification::new()))
-    } else {
-        None
-    };
-    let tls = build_default_tls_config(Arc::new(root_store), verifier);
 
-    Ok(WtClientConfig::builder()
+    // GREASE ECH: offer a dummy encrypted_client_hello extension exactly like
+    // Chrome does for servers without published ECH configs. Anti-
+    // ossification (middleboxes must tolerate the extension) + one more
+    // ClientHello field aligned with the browser. Zero-interaction by
+    // design: a server that ignores ECH simply proceeds with the outer SNI.
+    let grease = rustls::client::EchGreaseConfig::new(
+        &super::ech::HpkeX25519Sha256ChaCha20,
+        rustls::crypto::hpke::HpkePublicKey(rand_bytes_32()),
+    );
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut tls = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_ech(rustls::client::EchMode::Grease(grease))
+        .map_err(|e| anyhow!("ech grease enable: {e}"))?
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    if let Some(fp) = pin {
+        tls.dangerous()
+            .set_certificate_verifier(Arc::new(super::tls::PinVerifier::new(fp, provider)));
+    } else if skip_verify {
+        tls.dangerous()
+            .set_certificate_verifier(Arc::new(NoServerVerification::new()));
+    }
+    tls.alpn_protocols = [wtransport::tls::WEBTRANSPORT_ALPN.to_vec()].to_vec();
+
+    // Browser fingerprint alignment (borrowed from hysteria's Chrome parrot
+    // idea, implemented with the knobs wtransport actually exposes):
+    // * zero-length source CID — Chrome's signature, visible in every UDP
+    //   packet header (quinn defaults to 8 random bytes);
+    // * 8-byte initial destination CID — Chrome uses 8; quinn defaults to
+    //   MAX_CID_SIZE (20), which makes the very first datagram stand out.
+    // Both are public configuration on the built config (feature "quinn"),
+    // no forking required.
+    let mut config = WtClientConfig::builder()
         .with_bind_default()
         .with_custom_tls_and_transport(tls, crate::quic_tune::tuned(recv_window))
         .keep_alive_interval(Some(Duration::from_secs(15)))
-        .build())
+        .build();
+    config
+        .quic_endpoint_config_mut()
+        .cid_generator(|| Box::new(quinn_proto::RandomConnectionIdGenerator::new(0)));
+    config
+        .quic_config_mut()
+        .initial_dst_cid_provider(Arc::new(|| {
+            use quinn_proto::ConnectionIdGenerator as _;
+            quinn_proto::RandomConnectionIdGenerator::new(8).generate_cid()
+        }));
+
+    Ok(config)
+}
+
+/// Random 32 bytes for the GREASE ECH placeholder public key.
+fn rand_bytes_32() -> Vec<u8> {
+    use rand::RngCore;
+    let mut k = vec![0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut k);
+    k
 }
 
 impl WtConn {
@@ -250,7 +343,13 @@ impl WtConn {
         let opts = ConnectOptions::builder(&cfg.url)
             .add_header("Authorization", format!("Bearer {bearer}"))
             .build();
-        let conn = endpoint.connect(opts).await.context("wt connect failed")?;
+        // QUIC handshake must be bounded like every other step: on a UDP
+        // path that blackholes packets, an unbounded await would hang the
+        // pool maintenance task (slow-CI guard).
+        let conn = timeout(HANDSHAKE_TIMEOUT, endpoint.connect(opts))
+            .await
+            .map_err(|_| anyhow!("wt connect timeout"))?
+            .context("wt connect failed")?;
 
         // ---- control stream + AUTH handshake ----
         let opening = conn.open_bi().await?;
@@ -279,8 +378,12 @@ impl WtConn {
         let counters = CounterGen::stream();
         let static_cipher = Arc::new(FrameCipher::new(&cfg.static_key));
         let mut writer = FrameWriter::new(send, static_cipher, counters.clone());
+        // Handshake payload + random tail: the AUTH ciphertext length stops
+        // being a fixed protocol signature (server decodes by field prefix).
+        let mut auth_payload = auth.encode();
+        auth_payload.extend_from_slice(&random_padding());
         writer
-            .write(FrameType::Auth, 0, 0, &auth.encode())
+            .write(FrameType::Auth, 0, 0, &auth_payload)
             .await
             .context("send auth")?;
         writer.set_cipher(cipher.clone());
@@ -388,7 +491,14 @@ impl WtConn {
             });
             let this3 = this.clone();
             tokio::spawn(async move {
-                let mut iv = tokio::time::interval(Duration::from_secs(30));
+                // Fixed-interval heartbeats are a textbook beaconing signal
+                // (a passive observer can pick the connection out of a CDN's
+                // traffic by the 30s periodicity alone). Jitter each period
+                // by ±20% so the cadence carries no exploitable signature.
+                // The jitter must stay well inside the Pong-judge budget:
+                // PONG_MISS_LIMIT=2 with a 36s worst case still gives the
+                // link ~72s before being declared half-dead.
+                let mut iv = tokio::time::interval(heartbeat_interval());
                 iv.tick().await; // skip immediate tick
                 loop {
                     tokio::select! {
@@ -422,6 +532,9 @@ impl WtConn {
                     {
                         break;
                     }
+                    // Re-arm the next period with fresh jitter.
+                    iv = tokio::time::interval(heartbeat_interval());
+                    iv.tick().await; // consume the immediate first tick
                 }
             });
         }
@@ -470,6 +583,11 @@ impl WtConn {
                 crate::quic_tune::gap_hint(reason)
             );
         }
+        // Fail fast: drop pending UDP associate waiters and UDP routes so
+        // callers error out immediately instead of waiting out the
+        // HANDSHAKE_TIMEOUT on a dead connection.
+        self.pending_udp.clear();
+        self.udp.clear();
         self.close.cancel();
     }
 
@@ -504,9 +622,10 @@ impl WtConn {
         let mut writer = FrameWriter::new(send, self.cipher.clone(), self.counters.clone());
         let mut reader = FrameReader::new(recv, Some(self.cipher.clone()), None);
 
-        writer
-            .write(FrameType::Open, 0, sid, &encode_open(host, port))
-            .await?;
+        // Open payload + random tail (server decodes by field prefix).
+        let mut open_payload = encode_open(host, port);
+        open_payload.extend_from_slice(&random_padding());
+        writer.write(FrameType::Open, 0, sid, &open_payload).await?;
         let reply = timeout(HANDSHAKE_TIMEOUT, reader.read())
             .await
             .map_err(|_| anyhow!("open reply timeout"))??;
@@ -646,5 +765,51 @@ impl WtConn {
                 return v;
             }
         }
+    }
+}
+
+/// Extract the host and port from a `https://host[:port][/path]` URL.
+/// Used by the `--sni` masquerade to recover the real server address before
+/// the URL host is replaced with the masquerade name.
+///
+/// Resolution is async (`tokio::net::lookup_host`) and bounded, so a slow or
+/// blocked resolver at startup cannot stall the runtime thread.
+pub(crate) async fn url_host_and_port(url: &str) -> Result<(std::net::SocketAddr, u16)> {
+    let u = url::Url::parse(url).map_err(|e| anyhow!("bad URL '{url}': {e}"))?;
+    let host = u
+        .host_str()
+        .ok_or_else(|| anyhow!("URL '{url}' has no host"))?;
+    let port = u.port().unwrap_or(443);
+    let mut addrs = timeout(HANDSHAKE_TIMEOUT, tokio::net::lookup_host((host, port)))
+        .await
+        .map_err(|_| anyhow!("resolve '{host}': timeout"))?
+        .map_err(|e| anyhow!("resolve '{host}': {e}"))?;
+    let addr = addrs
+        .next()
+        .ok_or_else(|| anyhow!("no address for '{host}'"))?;
+    Ok((addr, port))
+}
+
+#[cfg(test)]
+mod heartbeat_tests {
+    use super::*;
+
+    #[test]
+    fn heartbeat_jitter_stays_in_band() {
+        for _ in 0..1000 {
+            let d = heartbeat_interval();
+            let s = d.as_secs();
+            assert!((24..=36).contains(&s), "jitter out of band: {s}s");
+        }
+    }
+
+    /// The band must keep the Pong-judge budget healthy: 2 missed periods at
+    /// the worst-case interval still leaves ~72s before declaring the link
+    /// half-dead (well above any plausible one-off network stall).
+    #[test]
+    fn heartbeat_budget_covers_pong_miss_limit() {
+        let worst = heartbeat_interval();
+        let budget = worst * (PONG_MISS_LIMIT as u32 + 1);
+        assert!(budget >= Duration::from_secs(60), "budget {budget:?}");
     }
 }
