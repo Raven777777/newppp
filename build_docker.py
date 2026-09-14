@@ -116,11 +116,6 @@ def interactive_args() -> str:
     print("  -c --auth alice:secret123 --server https://host "
           "--url wss://host/api/ppp --bind 0.0.0.0:1080")
     raw = input("启动参数: ").strip()
-    if raw:
-        extra = shlex.split(raw)
-        if not extra or extra[0] not in ("-c", "-s"):
-            raise SystemExit("启动参数必须以 -c 或 -s 开头")
-    return raw
 
 
 def main() -> None:
